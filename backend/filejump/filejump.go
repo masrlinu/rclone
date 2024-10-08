@@ -2,12 +2,17 @@ package filejump
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net/http"
+	"net/url"
+	"path"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
@@ -63,21 +68,21 @@ type Object struct {
 
 // FileEntry represents a file or folder in FileJump
 type FileEntry struct {
-	ID          int64     `json:"id"`
-	Name        string    `json:"name"`
-	FileName    string    `json:"file_name"`
-	FileSize    int64     `json:"file_size"`
-	ParentID    int64     `json:"parent_id"`
-	Thumbnail   string    `json:"thumbnail"`
-	Mime        string    `json:"mime"`
-	URL         string    `json:"url"`
-	Hash        string    `json:"hash"`
-	Type        string    `json:"type"`
-	Description string    `json:"description"`
-	DeletedAt   time.Time `json:"deleted_at"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	Path        string    `json:"path"`
+	ID          int64       `json:"id"`
+	Name        string      `json:"name"`
+	FileName    string      `json:"file_name"`
+	FileSize    int64       `json:"file_size"`
+	ParentID    int64       `json:"parent_id"`
+	Thumbnail   interface{} `json:"thumbnail"`
+	Mime        string      `json:"mime"`
+	URL         string      `json:"url"`
+	Hash        string      `json:"hash"`
+	Type        string      `json:"type"`
+	Description string      `json:"description"`
+	DeletedAt   time.Time   `json:"deleted_at"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
+	Path        string      `json:"path"`
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -147,8 +152,65 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	// Implementation here
-	return nil, fs.ErrorNotImplemented
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/drive/file-entries",
+	}
+
+	values := url.Values{}
+	values.Set("parentIds", directoryID)
+	values.Set("perPage", "1000")
+	opts.Parameters = values
+
+	var result struct {
+		Data []FileEntry `json:"data"`
+	}
+
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	for _, item := range result.Data {
+		remote := path.Join(dir, item.Name)
+		if item.Type == "folder" {
+			d := fs.NewDir(remote, time.Time(item.UpdatedAt))
+			entries = append(entries, d)
+		} else {
+			o, err := f.newObjectWithInfo(ctx, remote, &item)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, o)
+		}
+	}
+
+	return entries, nil
+}
+
+// Helper-Funktion zur Überprüfung, ob ein Retry notwendig ist
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if err != nil {
+		if fserrors.ShouldRetry(err) {
+			return true, err
+		}
+	} else if resp != nil {
+		switch resp.StatusCode {
+		case 429, 500, 502, 503, 504:
+			return true, fmt.Errorf("got status code %d", resp.StatusCode)
+		}
+	}
+	return false, err
 }
 
 // NewObject finds the Object at remote.  If it can't be found
@@ -167,7 +229,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // will return the object and the error, otherwise will return
 // nil and the error
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Implementation here
+	fs.Logf(nil, "Put wurde aufgerufen")
 	return nil, fs.ErrorNotImplemented
 }
 
@@ -175,7 +237,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 //
 // Shouldn't return an error if it already exists
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	// Implementation here
+	fs.Logf(nil, "Mkdir wurde aufgerufen für Verzeichnis: %s", dir)
 	return fs.ErrorNotImplemented
 }
 
@@ -183,7 +245,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 //
 // Return an error if it doesn't exist or isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	// Implementation here
+	fs.Logf(nil, "Rmdir wurde aufgerufen für Verzeichnis: %s", dir)
 	return fs.ErrorNotImplemented
 }
 
@@ -220,18 +282,18 @@ func (f *Fs) Features() *fs.Features {
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
-	// Implementation here
+	fs.Logf(nil, "FindLeaf wurde aufgerufen")
 	return "", false, fs.ErrorNotImplemented
 }
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
-	// Implementation here
+	fs.Logf(nil, "CreateDir wurde aufgerufen")
 	return "", fs.ErrorNotImplemented
 }
 
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *FileEntry) (fs.Object, error) {
-	// Implementation here
+	fs.Logf(nil, "newObjectWithInfo wurde aufgerufen")
 	return nil, fs.ErrorNotImplemented
 }
 
@@ -245,11 +307,13 @@ var (
 
 // SetModTime sets the metadata on the object to set the modification date
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
+	fs.Logf(nil, "SetModTime wurde aufgerufen")
 	return fs.ErrorNotImplemented
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.Logf(nil, "Open wurde aufgerufen")
 	return nil, fs.ErrorNotImplemented
 }
 
@@ -259,11 +323,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
 // return an error or update the object properly (rather than e.g. calling panic).
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	fs.Logf(nil, "Update wurde aufgerufen")
 	return fs.ErrorNotImplemented
 }
 
 // Removes this object
 func (o *Object) Remove(ctx context.Context) error {
+	fs.Logf(nil, "Remove wurde aufgerufen")
 	return fs.ErrorNotImplemented
 }
 
