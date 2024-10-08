@@ -293,8 +293,70 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 }
 
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *FileEntry) (fs.Object, error) {
-	fs.Logf(nil, "newObjectWithInfo wurde aufgerufen")
-	return nil, fs.ErrorNotImplemented
+	o := &Object{
+		fs:     f,
+		remote: remote,
+	}
+
+	if info != nil {
+		// Wenn Informationen bereitgestellt wurden, verwenden wir diese
+		err := o.setMetaData(info)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Andernfalls müssen wir die Informationen vom Server abrufen
+		err := o.readMetaData(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return o, nil
+}
+
+// setMetaData setzt die Metadaten des Objekts basierend auf den FileEntry-Informationen
+func (o *Object) setMetaData(info *FileEntry) error {
+	o.hasMetaData = true
+	o.size = info.FileSize
+	o.modTime = info.UpdatedAt
+	o.id = fmt.Sprintf("%d", info.ID)
+	o.mimeType = info.Mime
+	return nil
+}
+
+// readMetaData liest die Metadaten des Objekts vom Server
+func (o *Object) readMetaData(ctx context.Context) error {
+	path := "/drive/file-entries"
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   path,
+	}
+
+	query := url.Values{}
+	query.Set("query", o.remote)
+	opts.Parameters = query
+
+	var result struct {
+		Data []FileEntry `json:"data"`
+	}
+
+	var resp *http.Response
+	var err error
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if len(result.Data) == 0 {
+		return fs.ErrorObjectNotFound
+	}
+
+	return o.setMetaData(&result.Data[0])
 }
 
 // Check the interfaces are satisfied
