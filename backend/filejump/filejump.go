@@ -2,11 +2,11 @@ package filejump
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -34,6 +34,14 @@ func init() {
 			Name:     "access_token",
 			Help:     "You should create an API access token here: https://drive.filejump.com/account-settings",
 			Required: true,
+			// }, {
+			// 	Name:     config.ConfigEncoding,
+			// 	Help:     config.ConfigEncodingHelp,
+			// 	Advanced: true,
+			// 	Default: (encoder.Display |
+			// 		encoder.EncodeBackSlash |
+			// 		encoder.EncodeRightSpace |
+			// 		encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
@@ -152,10 +160,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	// fmt.Printf("List called with dir: %s\n", dir)
+
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
+		// fmt.Printf("Error finding directory ID for dir %s: %v\n", dir, err)
 		return nil, err
 	}
+	// fmt.Printf("Found directory ID: %s\n", directoryID)
 
 	opts := rest.Opts{
 		Method: "GET",
@@ -167,34 +179,68 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	values.Set("perPage", "1000")
 	opts.Parameters = values
 
+	// Log the full request URL
+	// requestURL := apiBaseURL + opts.Path + "?" + values.Encode()
+	// fmt.Printf("Full API Request URL:\n%s\n", requestURL)
+
 	var result struct {
 		Data []FileEntry `json:"data"`
 	}
 
 	var resp *http.Response
+	var body []byte
 	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
+		// fmt.Println("Making API call...")
+		resp, err = f.srv.Call(ctx, &opts)
+		if err != nil {
+			// fmt.Printf("Error during API call: %v\n", err)
+			return shouldRetry(ctx, resp, err)
+		}
+
+		// Read and log the full response body
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			// fmt.Printf("Error reading response body: %v\n", err)
+			return shouldRetry(ctx, resp, err)
+		}
+		// fmt.Printf("Full API Response:\n%s\n", string(body))
+
+		// Parse the JSON response
+		err = json.Unmarshal(body, &result)
+		if err != nil {
+			// fmt.Printf("Error parsing JSON response: %v\n", err)
+			return shouldRetry(ctx, resp, err)
+		}
+
+		return false, nil
 	})
 
 	if err != nil {
+		// fmt.Printf("Error after API call: %v\n", err)
 		return nil, err
 	}
 
+	// fmt.Printf("API call successful, received %d entries\n", len(result.Data))
+
 	for _, item := range result.Data {
-		remote := path.Join(dir, item.Name)
+		remote := item.Name
+		// fmt.Printf("Processing item: %s, type: %s\n", remote, item.Type)
 		if item.Type == "folder" {
 			d := fs.NewDir(remote, time.Time(item.UpdatedAt))
 			entries = append(entries, d)
+			// fmt.Printf("Added directory: %s\n", remote)
 		} else {
 			o, err := f.newObjectWithInfo(ctx, remote, &item)
 			if err != nil {
-				return nil, err
+				// fmt.Printf("Error creating object for %s: %v\n", remote, err)
+				continue
 			}
 			entries = append(entries, o)
+			// fmt.Printf("Added file: %s\n", remote)
 		}
 	}
 
+	// fmt.Printf("Returning %d entries\n", len(entries))
 	return entries, nil
 }
 
@@ -282,8 +328,43 @@ func (f *Fs) Features() *fs.Features {
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
-	fs.Logf(nil, "FindLeaf wurde aufgerufen")
-	return "", false, fs.ErrorNotImplemented
+	// Erstelle die API-Anfrage
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/drive/file-entries",
+	}
+
+	// Setze die Query-Parameter
+	values := url.Values{}
+	values.Set("parentIds", pathID)
+	values.Set("query", leaf)
+	values.Set("type", "folder")
+	opts.Parameters = values
+
+	var result struct {
+		Data []FileEntry `json:"data"`
+	}
+
+	// Führe die API-Anfrage aus
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return "", false, err
+	}
+
+	// Überprüfe, ob ein passendes Verzeichnis gefunden wurde
+	for _, entry := range result.Data {
+		if entry.Name == leaf && entry.Type == "folder" {
+			return fmt.Sprintf("%d", entry.ID), true, nil
+		}
+	}
+
+	// Wenn kein passendes Verzeichnis gefunden wurde
+	return "", false, nil
 }
 
 // CreateDir makes a directory with pathID as parent and name leaf
