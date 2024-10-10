@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -16,7 +18,6 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
-	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -34,6 +35,7 @@ func init() {
 			Name:     "access_token",
 			Help:     "You should create an API access token here: https://drive.filejump.com/account-settings",
 			Required: true,
+			// IsPassword: true,
 			// }, {
 			// 	Name:     config.ConfigEncoding,
 			// 	Help:     config.ConfigEncodingHelp,
@@ -48,8 +50,8 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	AccessToken string               `config:"access_token"`
-	Enc         encoder.MultiEncoder `config:"encoding"`
+	AccessToken string `config:"access_token"`
+	// Enc         encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote filejump server
@@ -100,6 +102,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
+
+	root = strings.Trim(root, "/")
 
 	client := fshttp.NewClient(ctx)
 
@@ -226,7 +230,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		remote := item.Name
 		// fmt.Printf("Processing item: %s, type: %s\n", remote, item.Type)
 		if item.Type == "folder" {
-			d := fs.NewDir(remote, time.Time(item.UpdatedAt))
+			sId := strconv.FormatInt(item.ID, 10)
+			f.dirCache.Put(remote, sId)
+			d := fs.NewDir(remote, time.Time(item.UpdatedAt)).SetID(sId).SetSize(item.FileSize).SetParentID(strconv.FormatInt(item.ParentID, 10))
 			entries = append(entries, d)
 			// fmt.Printf("Added directory: %s\n", remote)
 		} else {
