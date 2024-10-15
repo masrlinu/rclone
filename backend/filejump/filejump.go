@@ -2,22 +2,25 @@ package filejump
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/rclone/rclone/backend/filejump/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -44,14 +47,29 @@ func init() {
 			// 		encoder.EncodeBackSlash |
 			// 		encoder.EncodeRightSpace |
 			// 		encoder.EncodeInvalidUtf8),
+		}, {
+			Name:     config.ConfigEncoding,
+			Help:     config.ConfigEncodingHelp,
+			Advanced: true,
+			// From https://developer.box.com/docs/error-codes#section-400-bad-request :
+			// > Box only supports file or folder names that are 255 characters or less.
+			// > File names containing non-printable ascii, "/" or "\", names with leading
+			// > or trailing spaces, and the special names “.” and “..” are also unsupported.
+			//
+			// Testing revealed names with leading spaces work fine.
+			// Also encode invalid UTF-8 bytes as json doesn't handle them properly.
+			Default: (encoder.Display |
+				encoder.EncodeBackSlash |
+				encoder.EncodeRightSpace |
+				encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	AccessToken string `config:"access_token"`
-	// Enc         encoder.MultiEncoder `config:"encoding"`
+	AccessToken string               `config:"access_token"`
+	Enc         encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote filejump server
@@ -74,25 +92,6 @@ type Object struct {
 	modTime     time.Time
 	id          string
 	mimeType    string
-}
-
-// FileEntry represents a file or folder in FileJump
-type FileEntry struct {
-	ID          int64       `json:"id"`
-	Name        string      `json:"name"`
-	FileName    string      `json:"file_name"`
-	FileSize    int64       `json:"file_size"`
-	ParentID    int64       `json:"parent_id"`
-	Thumbnail   interface{} `json:"thumbnail"`
-	Mime        string      `json:"mime"`
-	URL         string      `json:"url"`
-	Hash        string      `json:"hash"`
-	Type        string      `json:"type"`
-	Description string      `json:"description"`
-	DeletedAt   time.Time   `json:"deleted_at"`
-	CreatedAt   time.Time   `json:"created_at"`
-	UpdatedAt   time.Time   `json:"updated_at"`
-	Path        string      `json:"path"`
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -152,6 +151,86 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
+// list the objects into the function supplied
+//
+// If directories is set it only sends directories
+// User function to process a File item from listAll
+//
+// Should return true to finish processing
+type listAllFn func(*api.Item) bool
+
+// Lists the directory required calling the user function on each item found
+//
+// If the user fn ever returns true then it early exits with found = true
+func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, activeOnly bool, fn listAllFn) (found bool, err error) {
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/drive/file-entries",
+	}
+
+	values := url.Values{}
+	values.Set("folderId", dirID)
+	// values.Set("parentIds", dirID)
+	values.Set("perPage", "1000")
+	opts.Parameters = values
+	// section=home
+	// folderId=0
+	// workspaceId=0
+	// orderBy=updated_at
+	// orderDir=desc
+	// page=1
+
+	var page *uint
+OUTER:
+	for {
+		if page != nil {
+			opts.Parameters.Set("page", strconv.FormatUint(uint64(*page), 10))
+		}
+
+		var result api.FileEntries
+		var resp *http.Response
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return found, fmt.Errorf("couldn't list files: %w", err)
+		}
+		for i := range result.Data {
+			item := &result.Data[i]
+			if item.Type == api.ItemTypeFolder {
+				if filesOnly {
+					continue
+				}
+			} else if item.Type != api.ItemTypeFolder {
+				if directoriesOnly {
+					continue
+				}
+			} else {
+				fs.Debugf(f, "Ignoring %q - unknown type %q", item.Name, item.Type)
+				continue
+			}
+			// At the moment, there is no trash at FileJump
+			// if activeOnly && item.ItemStatus != api.ItemStatusActive {
+			// 	continue
+			// }
+			// if f.opt.OwnedBy != "" && f.opt.OwnedBy != item.OwnedBy.Login {
+			// 	continue
+			// }
+			item.Name = f.opt.Enc.ToStandardName(item.Name)
+			if fn(item) {
+				found = true
+				break OUTER
+			}
+		}
+		page = result.NextPage
+		if page == nil {
+			break
+		}
+	}
+	return
+}
+
 // type Fs interface:
 
 // List the objects and directories in dir into entries.  The
@@ -164,105 +243,79 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	// fmt.Printf("List called with dir: %s\n", dir)
-
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
-		// fmt.Printf("Error finding directory ID for dir %s: %v\n", dir, err)
 		return nil, err
 	}
-	// fmt.Printf("Found directory ID: %s\n", directoryID)
-
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/drive/file-entries",
-	}
-
-	values := url.Values{}
-	values.Set("parentIds", directoryID)
-	values.Set("perPage", "1000")
-	opts.Parameters = values
-
-	// Log the full request URL
-	// requestURL := apiBaseURL + opts.Path + "?" + values.Encode()
-	// fmt.Printf("Full API Request URL:\n%s\n", requestURL)
-
-	var result struct {
-		Data []FileEntry `json:"data"`
-	}
-
-	var resp *http.Response
-	var body []byte
-	err = f.pacer.Call(func() (bool, error) {
-		// fmt.Println("Making API call...")
-		resp, err = f.srv.Call(ctx, &opts)
-		if err != nil {
-			// fmt.Printf("Error during API call: %v\n", err)
-			return shouldRetry(ctx, resp, err)
-		}
-
-		// Read and log the full response body
-		body, err = io.ReadAll(resp.Body)
-		if err != nil {
-			// fmt.Printf("Error reading response body: %v\n", err)
-			return shouldRetry(ctx, resp, err)
-		}
-		// fmt.Printf("Full API Response:\n%s\n", string(body))
-
-		// Parse the JSON response
-		err = json.Unmarshal(body, &result)
-		if err != nil {
-			// fmt.Printf("Error parsing JSON response: %v\n", err)
-			return shouldRetry(ctx, resp, err)
-		}
-
-		return false, nil
-	})
-
-	if err != nil {
-		// fmt.Printf("Error after API call: %v\n", err)
-		return nil, err
-	}
-
-	// fmt.Printf("API call successful, received %d entries\n", len(result.Data))
-
-	for _, item := range result.Data {
-		remote := item.Name
-		// fmt.Printf("Processing item: %s, type: %s\n", remote, item.Type)
-		if item.Type == "folder" {
-			sId := strconv.FormatInt(item.ID, 10)
-			f.dirCache.Put(remote, sId)
-			d := fs.NewDir(remote, time.Time(item.UpdatedAt)).SetID(sId).SetSize(item.FileSize).SetParentID(strconv.FormatInt(item.ParentID, 10))
+	var iErr error
+	_, err = f.listAll(ctx, directoryID, false, false, true, func(info *api.Item) bool {
+		remote := path.Join(dir, info.Name)
+		if info.Type == api.ItemTypeFolder {
+			// cache the directory ID for later lookups
+			f.dirCache.Put(remote, info.GetID())
+			d := fs.NewDir(remote, info.ModTime()).SetID(info.GetID())
+			// FIXME more info from dir?
 			entries = append(entries, d)
-			// fmt.Printf("Added directory: %s\n", remote)
-		} else {
-			o, err := f.newObjectWithInfo(ctx, remote, &item)
+		} else if info.Type != api.ItemTypeFolder {
+			o, err := f.newObjectWithInfo(ctx, remote, info)
 			if err != nil {
-				// fmt.Printf("Error creating object for %s: %v\n", remote, err)
-				continue
+				iErr = err
+				return true
 			}
 			entries = append(entries, o)
-			// fmt.Printf("Added file: %s\n", remote)
 		}
-	}
 
-	// fmt.Printf("Returning %d entries\n", len(entries))
+		// // Cache some metadata for this Item to help us process events later
+		// // on. In particular, the box event API does not provide the old path
+		// // of the Item when it is renamed/deleted/moved/etc.
+		// f.itemMetaCacheMu.Lock()
+		// cachedItemMeta, found := f.itemMetaCache[info.GetID()]
+		// if !found || cachedItemMeta.SequenceID < info.SequenceID {
+		// 	f.itemMetaCache[info.ID] = ItemMeta{SequenceID: info.SequenceID, ParentID: directoryID, Name: info.Name}
+		// }
+		// f.itemMetaCacheMu.Unlock()
+
+		return false
+	})
+	if err != nil {
+		return nil, err
+	}
+	if iErr != nil {
+		return nil, iErr
+	}
 	return entries, nil
 }
 
-// Helper-Funktion zur Überprüfung, ob ein Retry notwendig ist
+// retryErrorCodes is a slice of error codes that we will retry
+var retryErrorCodes = []int{
+	429, // Too Many Requests.
+	500, // Internal Server Error
+	502, // Bad Gateway
+	503, // Service Unavailable
+	504, // Gateway Timeout
+	509, // Bandwidth Limit Exceeded
+}
+
+// shouldRetry returns a boolean as to whether this resp and err
+// deserve to be retried.  It returns the err as a convenience
 func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
-	if err != nil {
-		if fserrors.ShouldRetry(err) {
-			return true, err
-		}
-	} else if resp != nil {
-		switch resp.StatusCode {
-		case 429, 500, 502, 503, 504:
-			return true, fmt.Errorf("got status code %d", resp.StatusCode)
-		}
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
 	}
-	return false, err
+	authRetry := false
+
+	if resp != nil && resp.StatusCode == 401 && strings.Contains(resp.Header.Get("Www-Authenticate"), "expired_token") {
+		authRetry = true
+		fs.Debugf(nil, "Should retry: %v", err)
+	}
+
+	// // FileJump API errors which should be retried
+	// if apiErr, ok := err.(*api.Error); ok && apiErr.Code == "operation_blocked_temporary" {
+	// 	fs.Debugf(nil, "Retrying API error %v", err)
+	// 	return true, err
+	// }
+
+	return authRetry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
 }
 
 // NewObject finds the Object at remote.  If it can't be found
@@ -334,43 +387,15 @@ func (f *Fs) Features() *fs.Features {
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
-	// Erstelle die API-Anfrage
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/drive/file-entries",
-	}
-
-	// Setze die Query-Parameter
-	values := url.Values{}
-	values.Set("parentIds", pathID)
-	values.Set("query", leaf)
-	values.Set("type", "folder")
-	opts.Parameters = values
-
-	var result struct {
-		Data []FileEntry `json:"data"`
-	}
-
-	// Führe die API-Anfrage aus
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		resp, err = f.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
-
-	if err != nil {
-		return "", false, err
-	}
-
-	// Überprüfe, ob ein passendes Verzeichnis gefunden wurde
-	for _, entry := range result.Data {
-		if entry.Name == leaf && entry.Type == "folder" {
-			return fmt.Sprintf("%d", entry.ID), true, nil
+	// Find the leaf in pathID
+	found, err = f.listAll(ctx, pathID, true, false, true, func(item *api.Item) bool {
+		if strings.EqualFold(item.Name, leaf) {
+			pathIDOut = item.GetID()
+			return true
 		}
-	}
-
-	// Wenn kein passendes Verzeichnis gefunden wurde
-	return "", false, nil
+		return false
+	})
+	return pathIDOut, found, err
 }
 
 // CreateDir makes a directory with pathID as parent and name leaf
@@ -379,72 +404,98 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	return "", fs.ErrorNotImplemented
 }
 
-func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *FileEntry) (fs.Object, error) {
+// Return an Object from a path
+//
+// If it can't be found it returns the error fs.ErrorObjectNotFound.
+func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Item) (fs.Object, error) {
 	o := &Object{
 		fs:     f,
 		remote: remote,
 	}
-
+	var err error
 	if info != nil {
-		// Wenn Informationen bereitgestellt wurden, verwenden wir diese
-		err := o.setMetaData(info)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		// Andernfalls müssen wir die Informationen vom Server abrufen
-		err := o.readMetaData(ctx)
-		if err != nil {
-			return nil, err
-		}
+		// Set info
+		err = o.setMetaData(info)
+		// } else {
+		// 	err = o.readMetaData(ctx) // reads info and meta, returning an error
 	}
-
+	if err != nil {
+		return nil, err
+	}
 	return o, nil
 }
 
-// setMetaData setzt die Metadaten des Objekts basierend auf den FileEntry-Informationen
-func (o *Object) setMetaData(info *FileEntry) error {
+// setMetaData sets the metadata from info
+func (o *Object) setMetaData(info *api.Item) (err error) {
+	if info.Type == api.ItemTypeFolder {
+		return fs.ErrorIsDir
+	}
+	if info.Type == api.ItemTypeFolder {
+		return fmt.Errorf("%q is %q: %w", o.remote, info.Type, fs.ErrorNotAFile)
+	}
 	o.hasMetaData = true
-	o.size = info.FileSize
-	o.modTime = info.UpdatedAt
-	o.id = fmt.Sprintf("%d", info.ID)
-	o.mimeType = info.Mime
+	o.size = int64(info.FileSize)
+	// o.sha1 = info.SHA1
+	o.modTime = info.ModTime()
+	o.id = info.GetID()
 	return nil
 }
 
-// readMetaData liest die Metadaten des Objekts vom Server
-func (o *Object) readMetaData(ctx context.Context) error {
-	path := "/drive/file-entries"
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   path,
-	}
+// // readMetaDataForPath reads the metadata from the path
+// func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Item, err error) {
+// 	// defer log.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
+// 	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
+// 	if err != nil {
+// 		if err == fs.ErrorDirNotFound {
+// 			return nil, fs.ErrorObjectNotFound
+// 		}
+// 		return nil, err
+// 	}
 
-	query := url.Values{}
-	query.Set("query", o.remote)
-	opts.Parameters = query
+// 	// Use preupload to find the ID
+// 	itemMini, err := f.preUploadCheck(ctx, leaf, directoryID, -1)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	if itemMini == nil {
+// 		return nil, fs.ErrorObjectNotFound
+// 	}
 
-	var result struct {
-		Data []FileEntry `json:"data"`
-	}
+// 	// Now we have the ID we can look up the object proper
+// 	opts := rest.Opts{
+// 		Method:     "GET",
+// 		Path:       "/files/" + itemMini.ID,
+// 		Parameters: fieldsValue(),
+// 	}
+// 	var item api.Item
+// 	err = f.pacer.Call(func() (bool, error) {
+// 		resp, err := f.srv.CallJSON(ctx, &opts, nil, &item)
+// 		return shouldRetry(ctx, resp, err)
+// 	})
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	return &item, nil
+// }
 
-	var resp *http.Response
-	var err error
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-		return shouldRetry(ctx, resp, err)
-	})
-
-	if err != nil {
-		return err
-	}
-
-	if len(result.Data) == 0 {
-		return fs.ErrorObjectNotFound
-	}
-
-	return o.setMetaData(&result.Data[0])
-}
+// // readMetaData gets the metadata if it hasn't already been fetched
+// //
+// // it also sets the info
+// func (o *Object) readMetaData(ctx context.Context) (err error) {
+// 	if o.hasMetaData {
+// 		return nil
+// 	}
+// 	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
+// 	if err != nil {
+// 		if apiErr, ok := err.(*api.Error); ok {
+// 			if apiErr.Code == "not_found" || apiErr.Code == "trashed" {
+// 				return fs.ErrorObjectNotFound
+// 			}
+// 		}
+// 		return err
+// 	}
+// 	return o.setMetaData(info)
+// }
 
 // Check the interfaces are satisfied
 var (
