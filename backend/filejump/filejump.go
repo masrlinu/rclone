@@ -2,6 +2,8 @@ package filejump
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,7 +28,8 @@ import (
 )
 
 const (
-	apiBaseURL = "https://drive.filejump.com/api/v1"
+	apiBaseURL          = "https://drive.filejump.com/api/v1"
+	defaultUploadCutoff = 50 * 1024 * 1024
 )
 
 func init() {
@@ -48,6 +51,11 @@ func init() {
 			// 		encoder.EncodeRightSpace |
 			// 		encoder.EncodeInvalidUtf8),
 		}, {
+			Name:     "upload_cutoff",
+			Help:     "Cutoff for switching to multipart upload (>= 50 MiB).",
+			Default:  fs.SizeSuffix(defaultUploadCutoff),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -68,8 +76,14 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	AccessToken string               `config:"access_token"`
-	Enc         encoder.MultiEncoder `config:"encoding"`
+	UploadCutoff fs.SizeSuffix `config:"upload_cutoff"`
+	// CommitRetries int                  `config:"commit_retries"`
+	Enc encoder.MultiEncoder `config:"encoding"`
+	// RootFolderID  string               `config:"root_folder_id"`
+	AccessToken string `config:"access_token"`
+	// ListChunk     int                  `config:"list_chunk"`
+	// OwnedBy       string               `config:"owned_by"`
+	// Impersonate   string               `config:"impersonate"`
 }
 
 // Fs represents a remote filejump server
@@ -92,6 +106,41 @@ type Object struct {
 	modTime     time.Time
 	id          string
 	mimeType    string
+}
+
+// callJSON ist eine generische Funktion für API-Aufrufe
+/*
+values := url.Values{}
+values.Set("EntryIds", fmt.Sprintf("[%s]", dir))
+values.Set("DeleteForever", strconv.FormatBool(true)))
+type resultDelete struct {
+	Status string `json:"status,omitempty"`
+}
+resultDelete, err := CallJSON[resultDelete](f, ctx, "POST", "/file-entries/delete", &values)
+
+if err != nil {
+	// Fehlerbehandlung
+}
+*/
+func CallJSON[T any](f *Fs, ctx context.Context, method string, path string, params *url.Values) (*T, error) {
+	var result T
+
+	opts := rest.Opts{
+		Method:     method,
+		Path:       path,
+		Parameters: *params,
+	}
+
+	err := f.pacer.Call(func() (bool, error) {
+		resp, err := f.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(ctx, resp, err)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &result, nil
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -324,6 +373,45 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	return f.newObjectWithInfo(ctx, remote, nil)
 }
 
+// Creates from the parameters passed in a half finished Object which
+// must have setMetaData called on it
+//
+// Returns the object, leaf, directoryID and error.
+//
+// Used to create new objects
+func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
+	// Create the directory for the object if it doesn't exist
+	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return
+	}
+	// Temporary Object under construction
+	o = &Object{
+		fs:     f,
+		remote: remote,
+	}
+	return o, leaf, directoryID, nil
+}
+
+// PutUnchecked the object into the container
+//
+// This will produce an error if the object already exists.
+//
+// Copy the reader in to the new object which is returned.
+//
+// The new object may have been created if an error is returned
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	remote := src.Remote()
+	size := src.Size()
+	modTime := src.ModTime(ctx)
+
+	o, _, _, err := f.createObject(ctx, remote, modTime, size)
+	if err != nil {
+		return nil, err
+	}
+	return o, o.Update(ctx, in, src, options...)
+}
+
 // Put in to the remote path with the modTime given of the given size
 //
 // When called from outside an Fs by rclone, src.Size() will always be >= 0.
@@ -333,25 +421,94 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // May create the object even if it returns an error - if so
 // will return the object and the error, otherwise will return
 // nil and the error
+
+// Put the object into the container
+//
+// Copy the reader in to the new object which is returned.
+//
+// The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	fs.Logf(nil, "Put wurde aufgerufen")
-	return nil, fs.ErrorNotImplemented
+	remote := src.Remote()
+	size := src.Size()
+	modTime := src.ModTime(ctx)
+
+	o, _, _, err := f.createObject(ctx, remote, modTime, size)
+	if err != nil {
+		return nil, err
+	}
+	return o, o.Update(ctx, in, src, options...)
 }
 
-// Mkdir makes the directory (container, bucket)
-//
-// Shouldn't return an error if it already exists
+// // Mkdir makes the directory (container, bucket)
+// //
+// // Shouldn't return an error if it already exists
+// func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+// 	presignResult, err := CallJSON[PresignResult](f, ctx, "POST", "/folders", url.Values{
+// 		"name": []string{dir}
+// :
+// "test123"
+// parentId
+// :
+// 		"Filename":     []string{leaf},
+// 		"Mime":         []string{"application/octet-stream"},
+// 		"Disk":         []string{"uploads"},
+// 		"Size":         []string{strconv.FormatInt(size, 10)},
+// 		"Extension":    []string{"bin"},
+// 		"WorkspaceID":  []string{"0"},
+// 		"ParentID":     []string{directoryID},
+// 		"RelativePath": []string{""},
+// 	})
+
+// 	if err != nil {
+// 		// Fehlerbehandlung
+// 	}
+// }
+
+// Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	fs.Logf(nil, "Mkdir wurde aufgerufen für Verzeichnis: %s", dir)
-	return fs.ErrorNotImplemented
+	_, err := f.dirCache.FindDir(ctx, dir, true)
+	return err
 }
 
-// Rmdir removes the directory (container, bucket) if empty
+// purgeCheck removes the root directory, if check is set then it
+// refuses to do so if it has anything in
+func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
+	root := path.Join(f.root, dir)
+	if root == "" {
+		return errors.New("can't purge root directory")
+	}
+	// dc := f.dirCache
+	// rootID, err := dc.FindDir(ctx, dir, false)
+	// if err != nil {
+	// 	return err
+	// }
+
+	values := url.Values{}
+	values.Set("EntryIds", fmt.Sprintf("[%s]", dir))
+	values.Set("DeleteForever", strconv.FormatBool(true))
+	type resultDelete struct {
+		Status string `json:"status,omitempty"`
+	}
+	result, err := CallJSON[resultDelete](f, ctx, "POST", "/file-entries/delete", &values)
+
+	if err != nil {
+		return fmt.Errorf("rmdir failed: %w", err)
+	}
+	if result.Status != "success" {
+		return errors.New("delete, no api success")
+	}
+	f.dirCache.FlushDir(dir)
+	if err != nil {
+		return errors.New("rmdir failed, no success response")
+	}
+	return nil
+}
+
+// Rmdir deletes the root folder
 //
-// Return an error if it doesn't exist or isn't empty
+// Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	fs.Logf(nil, "Rmdir wurde aufgerufen für Verzeichnis: %s", dir)
-	return fs.ErrorNotImplemented
+	return f.purgeCheck(ctx, dir, true)
 }
 
 // type Info interface:
@@ -400,8 +557,32 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
-	fs.Logf(nil, "CreateDir wurde aufgerufen")
-	return "", fs.ErrorNotImplemented
+	values := url.Values{}
+	values.Set("name", f.opt.Enc.FromStandardName(leaf))
+	values.Set("parentId", pathID)
+	type resultCreateDir struct {
+		Folder struct {
+			// Type        string    `json:"type,omitempty"`
+			// Name        string    `json:"name,omitempty"`
+			// FileName    string    `json:"file_name,omitempty"`
+			// ParentID    int       `json:"parent_id,omitempty"`
+			// OwnerID     int       `json:"owner_id,omitempty"`
+			// WorkspaceID int       `json:"workspace_id,omitempty"`
+			// UpdatedAt   time.Time `json:"updated_at,omitempty"`
+			// CreatedAt   time.Time `json:"created_at,omitempty"`
+			ID   int    `json:"id,omitempty"`
+			Path string `json:"path,omitempty"`
+		} `json:"folder,omitempty"`
+		Status string `json:"status,omitempty"`
+	}
+	result, err := CallJSON[resultCreateDir](f, ctx, "POST", "/folders", &values)
+
+	if err != nil {
+		// fmt.Printf("...Error %v\n", err)
+		return "", err
+	}
+	// fmt.Printf("...Id %q\n", *info.Id)
+	return strconv.Itoa(result.Folder.ID), nil
 }
 
 // Return an Object from a path
@@ -512,25 +693,248 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 }
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	fs.Logf(nil, "Open wurde aufgerufen")
-	return nil, fs.ErrorNotImplemented
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	if o.id == "" {
+		return nil, errors.New("Download nicht möglich - keine ID vorhanden")
+	}
+
+	fs.FixRangeOption(options, o.size)
+
+	var resp *http.Response
+	opts := rest.Opts{
+		Method:  "GET",
+		Path:    "/file-entries/download/" + o.id,
+		Options: options,
+	}
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err = o.fs.srv.Call(ctx, &opts)
+
+		if err != nil {
+			return shouldRetry(ctx, resp, err)
+		}
+
+		// Überprüfen Sie, ob es sich um eine Weiterleitung handelt
+		if resp.StatusCode == http.StatusFound {
+			redirectURL := resp.Header.Get("Location")
+			if redirectURL == "" {
+				return false, errors.New("Weiterleitungs-URL nicht gefunden")
+			}
+
+			// Folgen Sie der Weiterleitung
+			redirectResp, redirectErr := http.Get(redirectURL)
+			if redirectErr != nil {
+				return shouldRetry(ctx, redirectResp, redirectErr)
+			}
+
+			// Ersetzen Sie die ursprüngliche Antwort durch die Weiterleitung
+			resp = redirectResp
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return resp.Body, nil
 }
 
-// Update in to the object with the modTime given of the given size
+// Update the object with the contents of the io.Reader, modTime and size
 //
-// When called from outside an Fs by rclone, src.Size() will always be >= 0.
-// But for unknown-sized objects (indicated by src.Size() == -1), Upload should either
-// return an error or update the object properly (rather than e.g. calling panic).
-func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	fs.Logf(nil, "Update wurde aufgerufen")
-	return fs.ErrorNotImplemented
+// If existing is set then it updates the object rather than creating a new one.
+//
+// The new object may have been created if an error is returned.
+func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	// if o.fs.tokenRenewer != nil {
+	// 	o.fs.tokenRenewer.Start()
+	// 	defer o.fs.tokenRenewer.Stop()
+	// }
+
+	size := src.Size()
+
+	if size < 0 {
+		return errors.New("can't upload unknown sizes objects")
+	}
+
+	modTime := src.ModTime(ctx)
+	remote := o.Remote()
+
+	// Create the directory for the object if it doesn't exist
+	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return err
+	}
+
+	// Upload with simple or multipart
+	// if size <= int64(o.fs.opt.UploadCutoff) {
+	err = o.upload(ctx, in, leaf, directoryID, size, modTime, options...)
+	// } else {
+	// 	err = o.uploadMultipart(ctx, in, leaf, directoryID, size, modTime, options...)
+	// }
+	return err
+}
+
+// upload does a single non-multipart upload
+//
+// This is recommended for less than 50 MiB of content
+func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID string, size int64, modTime time.Time, options ...fs.OpenOption) (err error) {
+	// Anfordern der vorzeichneten URL
+	var presignResult struct {
+		URL    string `json:"url"`
+		Key    string `json:"key"`
+		ACL    string `json:"acl"`
+		Status string `json:"status"`
+	}
+
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/s3/simple/presign",
+	}
+	values := url.Values{}
+	values.Set("Filename", leaf)
+	values.Set("Mime", "application/octet-stream")
+	values.Set("Disk", "uploads")
+	values.Set("Size", strconv.FormatInt(size, 10))
+	values.Set("Extension", "bin")
+	values.Set("WorkspaceID", "0")
+	values.Set("ParentID", directoryID)
+	values.Set("RelativePath", "")
+
+	opts.Parameters = values
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &presignResult)
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: %w", err)
+	}
+
+	if presignResult.Status != "success" {
+		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: Status ist nicht 'success'")
+	}
+
+	// // OPTIONS-Request
+	// optionsReq, err := http.NewRequestWithContext(ctx, "OPTIONS", presignResult.URL, nil)
+	// if err != nil {
+	// 	return fmt.Errorf("fehler beim Erstellen des OPTIONS-Requests: %w", err)
+	// }
+
+	// optionsResp, err := http.DefaultClient.Do(optionsReq)
+	// if err != nil {
+	// 	return fmt.Errorf("fehler beim Ausführen des OPTIONS-Requests: %w", err)
+	// }
+	// optionsResp.Body.Close()
+
+	// PUT-Request
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, presignResult.URL, in)
+	if err != nil {
+		return fmt.Errorf("fehler beim Erstellen des PUT-Requests: %w", err)
+	}
+
+	// Setzen Sie hier die notwendigen Header
+	putReq.Header.Set("Content-Type", "application/octet-stream")
+	putReq.Header.Set("x-amz-acl", presignResult.ACL)
+
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil {
+		return fmt.Errorf("fehler beim Hochladen der Datei: %w", err)
+	}
+	defer putResp.Body.Close()
+
+	if putResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("fehler beim Hochladen der Datei: HTTP %d: %s", putResp.StatusCode, string(body))
+		// } else {
+		// 	body, _ := io.ReadAll(putResp.Body)
+		// 	fs.Log(nil, fmt.Sprintf("Datei hochgeladen: HTTP %v: %s", putResp.StatusCode, string(body)))
+	}
+
+	var fileEntries struct {
+		WorkspaceID     int    `json:"workspaceId"`
+		ParentID        int    `json:"parentId"`
+		RelativePath    string `json:"relativePath"`
+		Disk            string `json:"disk"`
+		ClientMime      string `json:"clientMime"`
+		ClientName      string `json:"clientName"`
+		Filename        string `json:"filename"`
+		Size            int    `json:"size"`
+		ClientExtension string `json:"clientExtension"`
+	}
+
+	var htmlResponse string
+
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.Call(ctx, &rest.Opts{
+			Method: "POST",
+			Path:   "/s3/entries",
+		})
+
+		if err != nil {
+			return shouldRetry(ctx, resp, err)
+		}
+
+		// Lesen Sie den gesamten Körper
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return shouldRetry(ctx, resp, readErr)
+		}
+
+		// Überprüfen Sie, ob es sich um HTML handelt
+		if strings.HasPrefix(strings.TrimSpace(string(bodyBytes)), "<") {
+			htmlResponse = string(bodyBytes)
+			// os.WriteFile("htmlRequest.txt", []byte(htmlResponse), 0644)
+			return false, nil // Kein Retry erforderlich, wir haben HTML
+		}
+
+		// Wenn es kein HTML ist, versuchen Sie es als JSON zu parsen
+		err = json.Unmarshal(bodyBytes, &fileEntries)
+		if err != nil {
+			return shouldRetry(ctx, resp, err)
+		}
+
+		return false, nil // Erfolgreicher JSON-Aufruf, kein Retry erforderlich
+	})
+
+	if err != nil {
+		if htmlResponse != "" {
+			// Wenn wir eine HTML-Antwort haben, geben wir sie zurück
+			fmt.Println("Erhaltene HTML-Antwort:")
+			fmt.Println(htmlResponse)
+			return nil
+		}
+		return fmt.Errorf("fehler beim Anfordern der Datei-Daten URL: %w", err)
+	}
+
+	// Setzen der Metadaten des Objekts
+	o.remote = fileEntries.ClientName
+	o.mimeType = fileEntries.ClientMime
+	o.size = int64(fileEntries.Size)
+	o.modTime = modTime
+
+	return nil
 }
 
 // Removes this object
 func (o *Object) Remove(ctx context.Context) error {
-	fs.Logf(nil, "Remove wurde aufgerufen")
-	return fs.ErrorNotImplemented
+	values := url.Values{}
+	values.Set("EntryIds", fmt.Sprintf("[%s]", o.id))
+	values.Set("DeleteForever", strconv.FormatBool(true))
+	type resultDelete struct {
+		Status string `json:"status,omitempty"`
+	}
+	result, err := CallJSON[resultDelete](o.fs, ctx, "POST", "/file-entries/delete", &values)
+
+	if err != nil {
+		return err
+	}
+	if result.Status != "success" {
+		return errors.New(result.Status)
+	}
+	return nil
 }
 
 // type ObjectInfo interface:
@@ -562,13 +966,64 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
+// readMetaDataForPath reads the metadata from the path
+func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Item, err error) {
+	// defer fs.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
+	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
+	if err != nil {
+		if err == fs.ErrorDirNotFound {
+			return nil, fs.ErrorObjectNotFound
+		}
+		return nil, err
+	}
+
+	found, err := f.listAll(ctx, directoryID, false, true, false, func(item *api.Item) bool {
+		if item.Name == leaf {
+			info = item
+			return true
+		}
+		return false
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fs.ErrorObjectNotFound
+	}
+	return info, nil
+}
+
+// readMetaData gets the metadata if it hasn't already been fetched
+//
+// it also sets the info
+func (o *Object) readMetaData(ctx context.Context) (err error) {
+	if o.hasMetaData {
+		return nil
+	}
+	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
+	if err != nil {
+		// if apiErr, ok := err.(*api.Error); ok {
+		// 	if apiErr.Code == "not_found" || apiErr.Code == "trashed" {
+		// 		return fs.ErrorObjectNotFound
+		// 	}
+		// }
+		return err
+	}
+	return o.setMetaData(info)
+}
+
 // ModTime returns the modification date of the file
 // It should return a best guess if one isn't available
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
-// Size returns the size of the file
+// Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
+	err := o.readMetaData(context.TODO())
+	if err != nil {
+		fs.Logf(o, "Failed to read metadata: %v", err)
+		return -1
+	}
 	return o.size
 }
