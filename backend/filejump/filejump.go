@@ -2,7 +2,6 @@ package filejump
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -780,6 +779,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 //
 // This is recommended for less than 50 MiB of content
 func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID string, size int64, modTime time.Time, options ...fs.OpenOption) (err error) {
+	directoryIDInt, _ := strconv.Atoi(directoryID)
+
 	// Anfordern der vorzeichneten URL
 	var presignResult struct {
 		URL    string `json:"url"`
@@ -792,20 +793,29 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		Method: "POST",
 		Path:   "/s3/simple/presign",
 	}
-	values := url.Values{}
-	values.Set("Filename", leaf)
-	values.Set("Mime", "application/octet-stream")
-	values.Set("Disk", "uploads")
-	values.Set("Size", strconv.FormatInt(size, 10))
-	values.Set("Extension", "bin")
-	values.Set("WorkspaceID", "0")
-	values.Set("ParentID", directoryID)
-	values.Set("RelativePath", "")
 
-	opts.Parameters = values
+	presignRequestBody := struct {
+		Filename     string `json:"filename"`
+		Mime         string `json:"mime"`
+		Disk         string `json:"disk"`
+		Size         int64  `json:"size"`
+		Extension    string `json:"extension"`
+		WorkspaceID  int    `json:"workspaceId"`
+		ParentID     int    `json:"parentId"`
+		RelativePath string `json:"relativePath"`
+	}{
+		Filename:     leaf,
+		Mime:         "application/octet-stream",
+		Disk:         "uploads",
+		Size:         size,
+		Extension:    "bin",
+		WorkspaceID:  0,
+		ParentID:     directoryIDInt,
+		RelativePath: "",
+	}
 
 	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &presignResult)
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, &presignRequestBody, &presignResult)
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
@@ -834,10 +844,23 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		return fmt.Errorf("fehler beim Erstellen des PUT-Requests: %w", err)
 	}
 
+	// // Erstellen Sie einen einmaligen Client nur für diesen Request
+	// client := &http.Client{
+	// 	Transport: &http.Transport{
+	// 		Proxy: func(_ *http.Request) (*url.URL, error) {
+	// 			return url.Parse("http://localhost:8888")
+	// 		},
+	// 		TLSClientConfig: &tls.Config{
+	// 			InsecureSkipVerify: true,
+	// 		},
+	// 	},
+	// }
+
 	// Setzen Sie hier die notwendigen Header
 	putReq.Header.Set("Content-Type", "application/octet-stream")
 	putReq.Header.Set("x-amz-acl", presignResult.ACL)
 
+	// putResp, err := client.Do(putReq)
 	putResp, err := http.DefaultClient.Do(putReq)
 	if err != nil {
 		return fmt.Errorf("fehler beim Hochladen der Datei: %w", err)
@@ -852,67 +875,57 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		// 	fs.Log(nil, fmt.Sprintf("Datei hochgeladen: HTTP %v: %s", putResp.StatusCode, string(body)))
 	}
 
-	var fileEntries struct {
-		WorkspaceID     int    `json:"workspaceId"`
-		ParentID        int    `json:"parentId"`
-		RelativePath    string `json:"relativePath"`
-		Disk            string `json:"disk"`
-		ClientMime      string `json:"clientMime"`
-		ClientName      string `json:"clientName"`
-		Filename        string `json:"filename"`
-		Size            int    `json:"size"`
-		ClientExtension string `json:"clientExtension"`
+	optsEntries := rest.Opts{
+		Method: "POST",
+		Path:   "/s3/entries",
+		ExtraHeaders: map[string]string{
+			"Accept":          "application/json",
+			"Accept-Encoding": "gzip, deflate, br, zstd",
+		},
 	}
 
-	var htmlResponse string
+	entriesRequestBody := struct {
+		WorkspaceID     int         `json:"workspaceId"`
+		ParentID        interface{} `json:"parentId"`
+		RelativePath    string      `json:"relativePath"`
+		Disk            string      `json:"disk"`
+		ClientMime      string      `json:"clientMime"`
+		ClientName      string      `json:"clientName"`
+		Filename        string      `json:"filename"`
+		Size            int64       `json:"size"`
+		ClientExtension string      `json:"clientExtension"`
+	}{
+		WorkspaceID: 0,
+		ParentID: func() interface{} {
+			if directoryIDInt == 0 {
+				return ""
+			}
+			return directoryIDInt
+		}(),
+		RelativePath:    "",
+		Disk:            "uploads",
+		ClientMime:      "application/octet-stream",
+		ClientName:      leaf,
+		Filename:        path.Base(presignResult.Key),
+		Size:            size,
+		ClientExtension: "bin",
+	}
+
+	var entriesResult api.Item
 
 	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err := o.fs.srv.Call(ctx, &rest.Opts{
-			Method: "POST",
-			Path:   "/s3/entries",
-		})
-
-		if err != nil {
-			return shouldRetry(ctx, resp, err)
-		}
-
-		// Lesen Sie den gesamten Körper
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return shouldRetry(ctx, resp, readErr)
-		}
-
-		// Überprüfen Sie, ob es sich um HTML handelt
-		if strings.HasPrefix(strings.TrimSpace(string(bodyBytes)), "<") {
-			htmlResponse = string(bodyBytes)
-			// os.WriteFile("htmlRequest.txt", []byte(htmlResponse), 0644)
-			return false, nil // Kein Retry erforderlich, wir haben HTML
-		}
-
-		// Wenn es kein HTML ist, versuchen Sie es als JSON zu parsen
-		err = json.Unmarshal(bodyBytes, &fileEntries)
-		if err != nil {
-			return shouldRetry(ctx, resp, err)
-		}
-
-		return false, nil // Erfolgreicher JSON-Aufruf, kein Retry erforderlich
+		resp, err := o.fs.srv.CallJSON(ctx, &optsEntries, &entriesRequestBody, &entriesResult)
+		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
-		if htmlResponse != "" {
-			// Wenn wir eine HTML-Antwort haben, geben wir sie zurück
-			fmt.Println("Erhaltene HTML-Antwort:")
-			fmt.Println(htmlResponse)
-			return nil
-		}
 		return fmt.Errorf("fehler beim Anfordern der Datei-Daten URL: %w", err)
 	}
 
 	// Setzen der Metadaten des Objekts
-	o.remote = fileEntries.ClientName
-	o.mimeType = fileEntries.ClientMime
-	o.size = int64(fileEntries.Size)
+	o.remote = entriesResult.FileName
+	o.mimeType = entriesResult.Mime
+	o.size = int64(entriesResult.FileSize)
 	o.modTime = modTime
 
 	return nil

@@ -33,7 +33,7 @@ type Item struct {
 	Name        string    `json:"name,omitempty"`
 	Description any       `json:"description,omitempty"`
 	FileName    string    `json:"file_name,omitempty"`
-	Mime        any       `json:"mime,omitempty"`
+	Mime        string    `json:"mime,omitempty"`
 	FileSize    int       `json:"file_size,omitempty"`
 	UserID      any       `json:"user_id,omitempty"`
 	ParentID    any       `json:"parent_id,omitempty"`
