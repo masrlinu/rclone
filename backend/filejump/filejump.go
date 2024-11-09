@@ -34,8 +34,8 @@ const (
 
 func init() {
 	fs.Register(&fs.RegInfo{
-		Name:        "filejump",
-		Description: "FileJump",
+		Name:        "bedrive (filejump, folderfort, ...)",
+		Description: "BeDrive (FileJump, FolderFort, ...)",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "access_token",
@@ -780,6 +780,7 @@ var (
 // SetModTime sets the metadata on the object to set the modification date
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	fs.Logf(nil, "SetModTime wurde aufgerufen")
+	panic("implement me")
 	return fs.ErrorNotImplemented
 }
 
