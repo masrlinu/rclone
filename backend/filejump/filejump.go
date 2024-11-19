@@ -1,11 +1,14 @@
 package filejump
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"path"
@@ -34,8 +37,8 @@ const (
 
 func init() {
 	fs.Register(&fs.RegInfo{
-		Name:        "bedrive (filejump, folderfort, ...)",
-		Description: "BeDrive (FileJump, FolderFort, ...)",
+		Name:        "filejump",
+		Description: "FileJump",
 		NewFs:       NewFs,
 		Options: []fs.Option{{
 			Name:     "access_token",
@@ -149,8 +152,18 @@ if err != nil {
 }
 */
 func CallJSON[T any, B any](f *Fs, ctx context.Context, method string, path string, params *url.Values, body *B) (*T, error) {
-	var result T
+	// Eingabeparameter in einer Zeile
+	logMsg := fmt.Sprintf("CallJSON: %s %s", method, path)
+	if params != nil && len(*params) > 0 {
+		logMsg += fmt.Sprintf(" params=%s", params.Encode())
+	}
+	if body != nil {
+		bodyJSON, _ := json.Marshal(body)
+		logMsg += fmt.Sprintf(" body=%s", string(bodyJSON))
+	}
+	fs.Logf(nil, logMsg)
 
+	var result T
 	opts := rest.Opts{
 		Method: method,
 		Path:   path,
@@ -160,14 +173,31 @@ func CallJSON[T any, B any](f *Fs, ctx context.Context, method string, path stri
 		},
 	}
 
-	opts.Parameters = *params
+	if params != nil {
+		opts.Parameters = *params
+	}
 
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, body, &result)
+
+		// Nur Status loggen wenn nicht OK
+		if resp != nil && resp.StatusCode != http.StatusOK {
+			fs.Logf(nil, "CallJSON: Response Status: %s (%d)", resp.Status, resp.StatusCode)
+		}
+
+		// Nur bei Erfolg und nicht-leerem Body loggen
+		if err == nil {
+			resultJSON, _ := json.Marshal(result)
+			if string(resultJSON) != "{}" && string(resultJSON) != "null" {
+				fs.Logf(nil, "CallJSON: Response Body: %s", string(resultJSON))
+			}
+		}
+
 		return shouldRetry(ctx, resp, err)
 	})
 
 	if err != nil {
+		fs.Logf(nil, "CallJSON: Error: %v", err)
 		return nil, err
 	}
 
@@ -226,6 +256,7 @@ func CallJSONPost[T any, B any](f *Fs, ctx context.Context, path string, body *B
 
 // NewFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+	fs.Logf(nil, "NewFs: Initialisiere neues Filesystem mit name='%s', root='%s'", name, root)
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
 	if err != nil {
@@ -248,7 +279,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 	f.srv.SetHeader("Authorization", "Bearer "+opt.AccessToken)
 
-	f.dirCache = dircache.New(root, "0", f)
+	var rootID string
+	f.dirCache = dircache.New(root, rootID, f)
 
 	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
@@ -256,7 +288,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		// Assume it's a file
 		newRoot, remote := dircache.SplitPath(root)
 		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, "0", &tempF)
+		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
 		tempF.root = newRoot
 		// Make new Fs which is the parent
 		err = tempF.dirCache.FindRoot(ctx, false)
@@ -293,6 +325,7 @@ type listAllFn func(*api.Item) bool
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, activeOnly bool, fn listAllFn) (found bool, err error) {
+	fs.Logf(nil, "listAll wurde aufgerufen")
 	values := url.Values{}
 	values.Set("folderId", dirID)
 	// values.Set("parentIds", dirID)
@@ -362,6 +395,7 @@ OUTER:
 // This should return ErrDirNotFound if the directory isn't
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	fs.Logf(nil, "List: Verzeichnis '%s' wird aufgelistet", dir)
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
 		return nil, err
@@ -440,6 +474,7 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	fs.Logf(nil, "NewObject wurde aufgerufen")
 	return f.newObjectWithInfo(ctx, remote, nil)
 }
 
@@ -450,6 +485,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 //
 // Used to create new objects
 func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
+	fs.Logf(nil, "createObject wurde aufgerufen")
 	// Create the directory for the object if it doesn't exist
 	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
@@ -471,6 +507,7 @@ func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time,
 //
 // The new object may have been created if an error is returned
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Logf(nil, "PutUnchecked wurde aufgerufen")
 	remote := src.Remote()
 	size := src.Size()
 	modTime := src.ModTime(ctx)
@@ -498,6 +535,7 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 //
 // The new object may have been created if an error is returned
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	fs.Logf(nil, "Put wurde aufgerufen")
 	remote := src.Remote()
 	size := src.Size()
 	modTime := src.ModTime(ctx)
@@ -536,6 +574,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	fs.Logf(nil, "Mkdir wurde aufgerufen")
 	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
@@ -543,15 +582,16 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // purgeCheck removes the root directory, if check is set then it
 // refuses to do so if it has anything in
 func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
+	fs.Logf(nil, "purgeCheck wurde aufgerufen")
 	root := path.Join(f.root, dir)
 	if root == "" {
 		return errors.New("can't purge root directory")
 	}
-	// dc := f.dirCache
-	// rootID, err := dc.FindDir(ctx, dir, false)
-	// if err != nil {
-	// 	return err
-	// }
+	dc := f.dirCache
+	rootID, err := dc.FindDir(ctx, dir, false)
+	if err != nil {
+		return err
+	}
 
 	type RequestDelete struct {
 		EntryIds      []int `json:"entryIds"`
@@ -562,7 +602,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		Status string `json:"status,omitempty"`
 	}
 
-	iDir, _ := strconv.Atoi(dir)
+	iDir, _ := strconv.Atoi(rootID)
 	request := RequestDelete{
 		EntryIds:      []int{iDir},
 		DeleteForever: true,
@@ -587,6 +627,7 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 //
 // Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	fs.Logf(nil, "Rmdir wurde aufgerufen")
 	return f.purgeCheck(ctx, dir, true)
 }
 
@@ -623,6 +664,7 @@ func (f *Fs) Features() *fs.Features {
 
 // FindLeaf finds a directory of name leaf in the folder with ID pathID
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
+	fs.Logf(nil, "FindLeaf: Suche nach Blatt '%s' in Verzeichnis mit ID '%s'", leaf, pathID)
 	// Find the leaf in pathID
 	found, err = f.listAll(ctx, pathID, true, false, true, func(item *api.Item) bool {
 		if strings.EqualFold(item.Name, leaf) {
@@ -636,19 +678,26 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	fs.Logf(nil, "CreateDir: Erstelle Verzeichnis '%s' in Parent-ID '%s'", leaf, pathID)
 	values := url.Values{}
 	values.Set("name", f.opt.Enc.FromStandardName(leaf))
 	values.Set("parentId", pathID)
 
 	type RequestCreateDir struct {
 		Name     string `json:"name"`
-		ParentID int    `json:"parentId"`
+		ParentID *int64 `json:"parentId"`
 	}
 
-	iPathId, _ := strconv.Atoi(pathID)
+	// Beim Erstellen des Requests:
+	iPathId, _ := strconv.ParseInt(pathID, 10, 64)
+	var parentID *int64
+	if pathID != "" {
+		parentID = &iPathId
+	}
+
 	requestCreateDir := RequestCreateDir{
 		Name:     f.opt.Enc.FromStandardName(leaf),
-		ParentID: iPathId,
+		ParentID: parentID,
 	}
 	type ResultCreateDir struct {
 		Folder struct {
@@ -680,6 +729,7 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 //
 // If it can't be found it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Item) (fs.Object, error) {
+	fs.Logf(nil, "newObjectWithInfo: Erstelle neues Objekt für Remote-Pfad '%s'", remote)
 	o := &Object{
 		fs:     f,
 		remote: remote,
@@ -688,8 +738,8 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Ite
 	if info != nil {
 		// Set info
 		err = o.setMetaData(info)
-		// } else {
-		// 	err = o.readMetaData(ctx) // reads info and meta, returning an error
+	} else {
+		err = o.readMetaData(ctx) // reads info and meta, returning an error
 	}
 	if err != nil {
 		return nil, err
@@ -699,6 +749,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Ite
 
 // setMetaData sets the metadata from info
 func (o *Object) setMetaData(info *api.Item) (err error) {
+	fs.Logf(nil, "setMetaData: Setze Metadaten für Objekt '%v'", o)
 	if info.Type == api.ItemTypeFolder {
 		return fs.ErrorIsDir
 	}
@@ -786,6 +837,7 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	fs.Logf(nil, "Open wurde aufgerufen")
 	if o.id == "" {
 		return nil, errors.New("Download nicht möglich - keine ID vorhanden")
 	}
@@ -839,6 +891,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 //
 // The new object may have been created if an error is returned.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
+	fs.Logf(nil, "Update wurde aufgerufen")
 	// if o.fs.tokenRenewer != nil {
 	// 	o.fs.tokenRenewer.Start()
 	// 	defer o.fs.tokenRenewer.Stop()
@@ -869,6 +922,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 }
 
 func getExtensionAndMime(filename string) (extension, mimeType string) {
+	fs.Logf(nil, "getExtensionAndMime: Ermittle Extension und MIME-Typ für '%s'", filename)
 	ext := path.Ext(filename)
 	if ext == "" {
 		return "bin", "application/octet-stream"
@@ -891,144 +945,224 @@ func getExtensionAndMime(filename string) (extension, mimeType string) {
 //
 // This is recommended for less than 50 MiB of content
 func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID string, size int64, modTime time.Time, options ...fs.OpenOption) (err error) {
-	directoryIDInt, _ := strconv.Atoi(directoryID)
-
-	// Anfordern der vorzeichneten URL
-	type ResultPresign struct {
-		URL    string `json:"url"`
-		Key    string `json:"key"`
-		ACL    string `json:"acl"`
-		Status string `json:"status"`
+	fs.Logf(nil, "upload: Lade Datei '%s' in Verzeichnis '%s' hoch (Größe: %d Bytes)", leaf, directoryID, size)
+	// Response-Struktur für den Upload
+	type UploadResponse struct {
+		Status    string `json:"status"`
+		FileEntry struct {
+			ID        int       `json:"id"`
+			Name      string    `json:"name"`
+			FileName  string    `json:"file_name"`
+			FileSize  int64     `json:"file_size"`
+			ParentID  int       `json:"parent_id"`
+			MimeType  string    `json:"mime"`
+			CreatedAt time.Time `json:"created_at"`
+		} `json:"fileEntry"`
 	}
 
-	type RequestPresign struct {
-		Filename     string `json:"filename"`
-		Mime         string `json:"mime"`
-		Disk         string `json:"disk"`
-		Size         int64  `json:"size"`
-		Extension    string `json:"extension"`
-		WorkspaceID  int    `json:"workspaceId"`
-		ParentID     int    `json:"parentId"`
-		RelativePath string `json:"relativePath"`
+	// Erstelle einen multipart Writer
+	var b bytes.Buffer
+	w := multipart.NewWriter(&b)
+
+	// Füge die Datei hinzu
+	fw, err := w.CreateFormFile("file", leaf)
+	if err != nil {
+		return fmt.Errorf("failed to create form file: %w", err)
 	}
 
-	ext, mime := getExtensionAndMime(leaf)
-
-	requestPresign := RequestPresign{
-		Filename:     leaf,
-		Mime:         mime,
-		Disk:         "uploads",
-		Size:         size,
-		Extension:    ext,
-		WorkspaceID:  0,
-		ParentID:     directoryIDInt,
-		RelativePath: "",
+	// Kopiere den Inhalt in den multipart Writer
+	if _, err := io.Copy(fw, in); err != nil {
+		return fmt.Errorf("failed to copy file: %w", err)
 	}
 
-	resultPresign, err := CallJSONPost[ResultPresign, RequestPresign](o.fs, ctx, "/s3/simple/presign", &requestPresign)
+	// Füge parentId hinzu, wenn vorhanden
+	if directoryID != "" {
+		if err := w.WriteField("parentId", directoryID); err != nil {
+			return fmt.Errorf("failed to add parentId: %w", err)
+		}
+	}
+
+	// Schließe den multipart Writer
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	// Erstelle die Request-Optionen
+	opts := rest.Opts{
+		Method: "POST",
+		Path:   "/uploads",
+		Body:   &b,
+		ExtraHeaders: map[string]string{
+			"Content-Type": w.FormDataContentType(),
+		},
+	}
+
+	// Führe den Request aus
+	var result UploadResponse
+	err = o.fs.pacer.Call(func() (bool, error) {
+		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &result)
+		return shouldRetry(ctx, resp, err)
+	})
 
 	if err != nil {
-		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: %w", err)
+		return fmt.Errorf("failed to upload file: %w", err)
 	}
 
-	if resultPresign.Status != "success" {
-		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: Status ist nicht 'success'")
+	// Überprüfe den Status
+	if result.Status != "success" {
+		return fmt.Errorf("upload failed: %s", result.Status)
 	}
 
-	// // OPTIONS-Request
-	// optionsReq, err := http.NewRequestWithContext(ctx, "OPTIONS", resultPresign.URL, nil)
-	// if err != nil {
-	// 	return fmt.Errorf("fehler beim Erstellen des OPTIONS-Requests: %w", err)
-	// }
-
-	// optionsResp, err := http.DefaultClient.Do(optionsReq)
-	// if err != nil {
-	// 	return fmt.Errorf("fehler beim Ausführen des OPTIONS-Requests: %w", err)
-	// }
-	// optionsResp.Body.Close()
-
-	// PUT-Request
-	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, resultPresign.URL, in)
-	if err != nil {
-		return fmt.Errorf("fehler beim Erstellen des PUT-Requests: %w", err)
-	}
-
-	// // Erstellen Sie einen einmaligen Client nur für diesen Request
-	// client := &http.Client{
-	// 	Transport: &http.Transport{
-	// 		Proxy: func(_ *http.Request) (*url.URL, error) {
-	// 			return url.Parse("http://localhost:8888")
-	// 		},
-	// 		TLSClientConfig: &tls.Config{
-	// 			InsecureSkipVerify: true,
-	// 		},
-	// 	},
-	// }
-
-	// Setzen Sie hier die notwendigen Header
-	putReq.Header.Set("Content-Type", "application/octet-stream")
-	putReq.Header.Set("x-amz-acl", resultPresign.ACL)
-
-	// putResp, err := client.Do(putReq)
-	putResp, err := http.DefaultClient.Do(putReq)
-	if err != nil {
-		return fmt.Errorf("fehler beim Hochladen der Datei: %w", err)
-	}
-	defer putResp.Body.Close()
-
-	if putResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(putResp.Body)
-		return fmt.Errorf("fehler beim Hochladen der Datei: HTTP %d: %s", putResp.StatusCode, string(body))
-		// } else {
-		// 	body, _ := io.ReadAll(putResp.Body)
-		// 	fs.Log(nil, fmt.Sprintf("Datei hochgeladen: HTTP %v: %s", putResp.StatusCode, string(body)))
-	}
-
-	type RequestEntries struct {
-		WorkspaceID     int         `json:"workspaceId"`
-		ParentID        interface{} `json:"parentId"`
-		RelativePath    string      `json:"relativePath"`
-		Disk            string      `json:"disk"`
-		ClientMime      string      `json:"clientMime"`
-		ClientName      string      `json:"clientName"`
-		Filename        string      `json:"filename"`
-		Size            int64       `json:"size"`
-		ClientExtension string      `json:"clientExtension"`
-	}
-	requestEntries := RequestEntries{
-		WorkspaceID: 0,
-		ParentID: func() interface{} {
-			if directoryIDInt == 0 {
-				return ""
-			}
-			return directoryIDInt
-		}(),
-		RelativePath:    "",
-		Disk:            "uploads",
-		ClientMime:      "application/octet-stream",
-		ClientName:      leaf,
-		Filename:        path.Base(resultPresign.Key),
-		Size:            size,
-		ClientExtension: "bin",
-	}
-
-	resultEntries, err := CallJSONPost[api.Item, RequestEntries](o.fs, ctx, "/s3/entries", &requestEntries)
-
-	if err != nil {
-		return fmt.Errorf("fehler beim Anfordern der Datei-Daten URL: %w", err)
-	}
-
-	// Setzen der Metadaten des Objekts
-	o.remote = resultEntries.FileName
-	o.mimeType = resultEntries.Mime
-	o.size = int64(resultEntries.FileSize)
-	o.modTime = modTime
+	// Aktualisiere das Object mit den erhaltenen Daten
+	o.id = strconv.Itoa(result.FileEntry.ID)
+	o.size = result.FileEntry.FileSize
+	o.modTime = result.FileEntry.CreatedAt
+	o.mimeType = result.FileEntry.MimeType
+	o.hasMetaData = true
 
 	return nil
 }
 
+// func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID string, size int64, modTime time.Time, options ...fs.OpenOption) (err error) {
+// 	directoryIDInt, _ := strconv.Atoi(directoryID)
+
+// 	// Anfordern der vorzeichneten URL
+// 	type ResultPresign struct {
+// 		URL    string `json:"url"`
+// 		Key    string `json:"key"`
+// 		ACL    string `json:"acl"`
+// 		Status string `json:"status"`
+// 	}
+
+// 	type RequestPresign struct {
+// 		Filename     string `json:"filename"`
+// 		Mime         string `json:"mime"`
+// 		Disk         string `json:"disk"`
+// 		Size         int64  `json:"size"`
+// 		Extension    string `json:"extension"`
+// 		WorkspaceID  int    `json:"workspaceId"`
+// 		ParentID     int    `json:"parentId"`
+// 		RelativePath string `json:"relativePath"`
+// 	}
+
+// 	ext, mime := getExtensionAndMime(leaf)
+
+// 	requestPresign := RequestPresign{
+// 		Filename:     leaf,
+// 		Mime:         mime,
+// 		Disk:         "uploads",
+// 		Size:         size,
+// 		Extension:    ext,
+// 		WorkspaceID:  0,
+// 		ParentID:     directoryIDInt,
+// 		RelativePath: "",
+// 	}
+
+// 	resultPresign, err := CallJSONPost[ResultPresign, RequestPresign](o.fs, ctx, "/s3/simple/presign", &requestPresign)
+
+// 	if err != nil {
+// 		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: %w", err)
+// 	}
+
+// 	if resultPresign.Status != "success" {
+// 		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: Status ist nicht 'success'")
+// 	}
+
+// 	// // OPTIONS-Request
+// 	// optionsReq, err := http.NewRequestWithContext(ctx, "OPTIONS", resultPresign.URL, nil)
+// 	// if err != nil {
+// 	// 	return fmt.Errorf("fehler beim Erstellen des OPTIONS-Requests: %w", err)
+// 	// }
+
+// 	// optionsResp, err := http.DefaultClient.Do(optionsReq)
+// 	// if err != nil {
+// 	// 	return fmt.Errorf("fehler beim Ausführen des OPTIONS-Requests: %w", err)
+// 	// }
+// 	// optionsResp.Body.Close()
+
+// 	// PUT-Request
+// 	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, resultPresign.URL, in)
+// 	if err != nil {
+// 		return fmt.Errorf("fehler beim Erstellen des PUT-Requests: %w", err)
+// 	}
+
+// 	// // Erstellen Sie einen einmaligen Client nur für diesen Request
+// 	// client := &http.Client{
+// 	// 	Transport: &http.Transport{
+// 	// 		Proxy: func(_ *http.Request) (*url.URL, error) {
+// 	// 			return url.Parse("http://localhost:8888")
+// 	// 		},
+// 	// 		TLSClientConfig: &tls.Config{
+// 	// 			InsecureSkipVerify: true,
+// 	// 		},
+// 	// 	},
+// 	// }
+
+// 	// Setzen Sie hier die notwendigen Header
+// 	putReq.Header.Set("Content-Type", "application/octet-stream")
+// 	putReq.Header.Set("x-amz-acl", resultPresign.ACL)
+
+// 	// putResp, err := client.Do(putReq)
+// 	putResp, err := http.DefaultClient.Do(putReq)
+// 	if err != nil {
+// 		return fmt.Errorf("fehler beim Hochladen der Datei: %w", err)
+// 	}
+// 	defer putResp.Body.Close()
+
+// 	if putResp.StatusCode != http.StatusOK {
+// 		body, _ := io.ReadAll(putResp.Body)
+// 		return fmt.Errorf("fehler beim Hochladen der Datei: HTTP %d: %s", putResp.StatusCode, string(body))
+// 		// } else {
+// 		// 	body, _ := io.ReadAll(putResp.Body)
+// 		// 	fs.Log(nil, fmt.Sprintf("Datei hochgeladen: HTTP %v: %s", putResp.StatusCode, string(body)))
+// 	}
+
+// 	type RequestEntries struct {
+// 		WorkspaceID     int         `json:"workspaceId"`
+// 		ParentID        interface{} `json:"parentId"`
+// 		RelativePath    string      `json:"relativePath"`
+// 		Disk            string      `json:"disk"`
+// 		ClientMime      string      `json:"clientMime"`
+// 		ClientName      string      `json:"clientName"`
+// 		Filename        string      `json:"filename"`
+// 		Size            int64       `json:"size"`
+// 		ClientExtension string      `json:"clientExtension"`
+// 	}
+// 	requestEntries := RequestEntries{
+// 		WorkspaceID: 0,
+// 		ParentID: func() interface{} {
+// 			if directoryIDInt == 0 {
+// 				return ""
+// 			}
+// 			return directoryIDInt
+// 		}(),
+// 		RelativePath:    "",
+// 		Disk:            "uploads",
+// 		ClientMime:      "application/octet-stream",
+// 		ClientName:      leaf,
+// 		Filename:        path.Base(resultPresign.Key),
+// 		Size:            size,
+// 		ClientExtension: "bin",
+// 	}
+
+// 	resultEntries, err := CallJSONPost[api.Item, RequestEntries](o.fs, ctx, "/s3/entries", &requestEntries)
+
+// 	if err != nil {
+// 		return fmt.Errorf("fehler beim Anfordern der Datei-Daten URL: %w", err)
+// 	}
+
+// 	// Setzen der Metadaten des Objekts
+// 	o.remote = resultEntries.FileName
+// 	o.mimeType = resultEntries.Mime
+// 	o.size = int64(resultEntries.FileSize)
+// 	o.modTime = modTime
+
+// 	return nil
+// }
+
 // Removes this object
 func (o *Object) Remove(ctx context.Context) error {
+	fs.Logf(nil, "Remove: Lösche Objekt '%s' (ID: %s)", o.remote, o.id)
 	type RequestDelete struct {
 		EntryIds      []int `json:"entryIds"`
 		DeleteForever bool  `json:"deleteForever"`
@@ -1059,33 +1193,39 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Fs returns read only access to the Fs that this object is part of
 func (o *Object) Fs() fs.Info {
+	fs.Logf(nil, "Fs wurde aufgerufen")
 	return o.fs
 }
 
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+	fs.Logf(nil, "Hash wurde aufgerufen")
 	return "", hash.ErrUnsupported
 }
 
 // Storable says whether this object can be stored
 func (o *Object) Storable() bool {
+	fs.Logf(nil, "Storable wurde aufgerufen")
 	return true
 }
 
 // type DirEntry interface:
 // String returns a description of the Object
 func (o *Object) String() string {
+	fs.Logf(nil, "String: Erstelle String-Repräsentation für '%s'", o.remote)
 	return o.remote
 }
 
 // Remote returns the remote path
 func (o *Object) Remote() string {
+	fs.Logf(nil, "Remote: Hole Remote-Pfad für '%s'", o.remote)
 	return o.remote
 }
 
 // readMetaDataForPath reads the metadata from the path
 func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Item, err error) {
+	fs.Logf(nil, "readMetaDataForPath: Lese Metadaten für Pfad '%s'", path)
 	// defer fs.Trace(f, "path=%q", path)("info=%+v, err=%v", &info, &err)
 	leaf, directoryID, err := f.dirCache.FindPath(ctx, path, false)
 	if err != nil {
@@ -1115,16 +1255,15 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 //
 // it also sets the info
 func (o *Object) readMetaData(ctx context.Context) (err error) {
+	fs.Logf(nil, "readMetaData: Lese Metadaten für Objekt '%s'", o.remote)
 	if o.hasMetaData {
 		return nil
 	}
 	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
 	if err != nil {
-		// if apiErr, ok := err.(*api.Error); ok {
-		// 	if apiErr.Code == "not_found" || apiErr.Code == "trashed" {
-		// 		return fs.ErrorObjectNotFound
-		// 	}
-		// }
+		if err.Error() == "object not found" {
+			return fs.ErrorObjectNotFound
+		}
 		return err
 	}
 	return o.setMetaData(info)
@@ -1133,14 +1272,15 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 // ModTime returns the modification date of the file
 // It should return a best guess if one isn't available
 func (o *Object) ModTime(ctx context.Context) time.Time {
+	fs.Logf(nil, "ModTime: Hole Modifikationszeit für '%s'", o.remote)
 	return o.modTime
 }
 
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
+	fs.Logf(nil, "Size: Hole Größe für '%s'", o.remote)
 	err := o.readMetaData(context.TODO())
 	if err != nil {
-		fs.Logf(o, "Failed to read metadata: %v", err)
 		return -1
 	}
 	return o.size
