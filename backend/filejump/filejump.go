@@ -149,8 +149,110 @@ func (f *Fs) Features() *fs.Features {
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            true,
 		WriteMimeType:           true,
+		Copy:                    f.copy,
 	}).Fill(context.Background(), f)
 }
+
+// getObject gets an object by its remote path
+func (f *Fs) getObject(ctx context.Context, remote string) (*Object, error) {
+	// List files in the directory
+	dir := path.Dir(remote)
+	entries, err := f.List(ctx, dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list directory: %w", err)
+	}
+
+	// Find the object
+	for _, entry := range entries {
+		if entry.Remote() == remote {
+			if o, ok := entry.(*Object); ok {
+				return o, nil
+			}
+			return nil, fmt.Errorf("entry is not an object: %s", remote)
+		}
+	}
+
+	return nil, fs.ErrorObjectNotFound
+}
+
+// copy an object
+func (f *Fs) copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	// Get source object
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fmt.Errorf("invalid source object type")
+	}
+
+	// Get destination parent ID
+	dstParentID, err := f.getParentID(ctx, path.Dir(remote))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get destination parent ID: %w", err)
+	}
+
+	// Create request body
+	body := struct {
+		EntryIDs      []string `json:"entryIds"`
+		DestinationID int64    `json:"destinationId"`
+	}{
+		EntryIDs:      []string{srcObj.id},
+		DestinationID: dstParentID,
+	}
+
+	// Marshal body
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+
+	// Create request
+	url := fmt.Sprintf("%s/file-entries/duplicate", apiURL)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set content type
+	req.Header.Set("Content-Type", "application/json")
+
+	// Make request with retries
+	resp, err := f.doRequest(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bad response from server: %s - %s", resp.Status, string(respBody))
+	}
+
+	// Parse response
+	var result struct {
+		Entries []FileEntry `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(result.Entries) == 0 {
+		return nil, fmt.Errorf("no entries returned after copy")
+	}
+
+	// Create new object
+	entry := result.Entries[0]
+	modTime, _ := parseTime(entry.UpdatedAt)
+	o := &Object{
+		fs:      f,
+		remote:  remote,
+		id:      fmt.Sprintf("%d", entry.ID),
+		bytes:   entry.FileSize,
+		modTime: modTime,
+	}
+
+	return o, nil
+}
+
 
 // setRoot sets the root of the Fs
 func (f *Fs) setRoot(root string) {
@@ -253,45 +355,54 @@ func (f *Fs) getParentID(ctx context.Context, p string) (int64, error) {
 			continue
 		}
 
-		// List entries in the current parent
-		url := fmt.Sprintf("%s/drive/file-entries", apiURL)
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			return 0, fmt.Errorf("failed to create request: %w", err)
-		}
-		q := req.URL.Query()
-		q.Add("parentIds", fmt.Sprintf("%d", parentID))
-		req.URL.RawQuery = q.Encode()
+		var entry *FileEntry
+		for i := 0; i < 5; i++ {
+			// List entries in the current parent
+			url := fmt.Sprintf("%s/drive/file-entries", apiURL)
+			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+			if err != nil {
+				return 0, fmt.Errorf("failed to create request: %w", err)
+			}
+			q := req.URL.Query()
+			q.Add("parentIds", fmt.Sprintf("%d", parentID))
+			req.URL.RawQuery = q.Encode()
 
-		resp, err := f.doRequest(ctx, req)
-		if err != nil {
-			return 0, fmt.Errorf("failed to make request: %w", err)
-		}
-		respBody, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return 0, fmt.Errorf("failed to read response body: %w", err)
-		}
-		fs.Debugf(f, "getParentID response: %s", string(respBody))
+			resp, err := f.doRequest(ctx, req)
+			if err != nil {
+				return 0, fmt.Errorf("failed to make request: %w", err)
+			}
+			respBody, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				return 0, fmt.Errorf("failed to read response body: %w", err)
+			}
+			fs.Debugf(f, "getParentID response: %s", string(respBody))
 
-		var result struct {
-			Data []FileEntry `json:"data"`
-		}
-		if err := json.Unmarshal(respBody, &result); err != nil {
-			return 0, fmt.Errorf("failed to parse response: %w", err)
-		}
+			var result struct {
+				Data []FileEntry `json:"data"`
+			}
+			if err := json.Unmarshal(respBody, &result); err != nil {
+				return 0, fmt.Errorf("failed to parse response: %w", err)
+			}
 
-		found := false
-		for _, entry := range result.Data {
-			if entry.Type == "folder" && entry.Name == part {
-				parentID = entry.ID
-				found = true
+			found := false
+			for _, e := range result.Data {
+				if e.Type == "folder" && e.Name == part {
+					entry = &e
+					found = true
+					break
+				}
+			}
+			if found {
 				break
 			}
+			time.Sleep(time.Second)
 		}
-		if !found {
+
+		if entry == nil {
 			return 0, fmt.Errorf("parent folder not found: %s", part)
 		}
+		parentID = entry.ID
 	}
 	return parentID, nil
 }
@@ -409,7 +520,15 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	// Get parent ID
 	parentID, err := f.getParentID(ctx, path.Dir(src.Remote()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get parent ID: %w", err)
+		// If parent doesn't exist, create it
+		err = f.Mkdir(ctx, path.Dir(src.Remote()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create parent directory: %w", err)
+		}
+		parentID, err = f.getParentID(ctx, path.Dir(src.Remote()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to get parent ID after creating directory: %w", err)
+		}
 	}
 
 	// Create multipart form data
@@ -428,13 +547,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, fmt.Errorf("failed to copy file content: %w", err)
 	}
 
-	// Add parentId (camelCase)
+	// Add parentId
 	if err := writer.WriteField("parentId", fmt.Sprintf("%d", parentID)); err != nil {
 		return nil, fmt.Errorf("failed to write parentId: %w", err)
-	}
-	// Add parent_id (snake_case) for compatibility
-	if err := writer.WriteField("parent_id", fmt.Sprintf("%d", parentID)); err != nil {
-		return nil, fmt.Errorf("failed to write parent_id: %w", err)
 	}
 
 	// Close writer
@@ -461,7 +576,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	// Check response status
 	if resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("bad response from server: %s", resp.Status)
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("bad response from server: %s - %s", resp.Status, string(respBody))
 	}
 
 	// Parse response
@@ -489,7 +605,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // Mkdir creates a container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	// Get parent ID
-	parentID, err := f.getParentID(ctx, dir)
+	parentID, err := f.getParentID(ctx, path.Dir(dir))
 	if err != nil {
 		return err
 	}
@@ -586,6 +702,11 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	dirID, err := f.getParentID(ctx, dir)
 	if err != nil {
 		return fmt.Errorf("failed to get directory ID: %w", err)
+	}
+
+	// Don't delete root
+	if dirID == 0 {
+		return nil
 	}
 
 	// Create request body
@@ -805,18 +926,6 @@ func (o *Object) Remove(ctx context.Context) error {
 	// Check response status
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad response from server: %s", resp.Status)
-	}
-
-	// Parse response
-	var result struct {
-		Status string `json:"status"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if result.Status != "success" {
-		return fmt.Errorf("unexpected status: %s", result.Status)
 	}
 
 	return nil
