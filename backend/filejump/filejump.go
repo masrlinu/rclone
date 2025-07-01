@@ -898,7 +898,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	size := src.Size()
 
 	if size < 0 {
-		return errors.New("can't upload unknown sizes objects")
+		return fs.ErrorNotSupported
 	}
 
 	modTime := src.ModTime(ctx)
@@ -1150,10 +1150,10 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 	}
 
 	// Setzen der Metadaten des Objekts
-	o.remote = resultEntries.FileName
-	o.mimeType = resultEntries.Mime
-	o.size = int64(resultEntries.FileSize)
-	o.modTime = modTime
+	err = o.setMetaData(resultEntries)
+	if err != nil {
+		return fmt.Errorf("fehler beim Setzen der Metadaten: %w", err)
+	}
 
 	return nil
 }
@@ -1212,6 +1212,13 @@ func (o *Object) Storable() bool {
 // String returns a description of the Object
 func (o *Object) String() string {
 	fs.Logf(nil, "String: Erstelle String-Repräsentation für '%s'", o.remote)
+	if o.remote == "" {
+		return ""
+	}
+	err := o.readMetaData(context.Background())
+	if err != nil {
+		return err.Error()
+	}
 	return o.remote
 }
 
@@ -1271,6 +1278,11 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 // It should return a best guess if one isn't available
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	fs.Logf(nil, "ModTime: Hole Modifikationszeit für '%s'", o.remote)
+	err := o.readMetaData(ctx)
+	if err != nil {
+		fs.Logf(o, "Failed to read metadata: %v", err)
+		return time.Now()
+	}
 	return o.modTime
 }
 
@@ -1279,6 +1291,7 @@ func (o *Object) Size() int64 {
 	fs.Logf(nil, "Size: Hole Größe für '%s'", o.remote)
 	err := o.readMetaData(context.TODO())
 	if err != nil {
+		fs.Logf(o, "Failed to read metadata: %v", err)
 		return -1
 	}
 	return o.size
