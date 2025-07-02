@@ -894,6 +894,20 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// 	defer o.fs.tokenRenewer.Stop()
 	// }
 
+	// check if file exists
+	_, err = o.fs.NewObject(ctx, src.Remote())
+	if err != nil && err != fs.ErrorObjectNotFound {
+		fs.Logf(o, "Error checking for existing object: %v", err)
+	}
+
+	if err == nil {
+		// object exists, remove it
+		err = o.Remove(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
 	size := src.Size()
 
 	if size < 0 {
