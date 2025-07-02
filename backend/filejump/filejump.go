@@ -1083,7 +1083,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		return fmt.Errorf("fehler beim Erstellen des PUT-Requests: %w", err)
 	}
 
-	// // Erstellen Sie einen einmaligen Client nur für diesen Request
+	// // Einen einmaligen Client nur für diesen Request erstellen
 	// client := &http.Client{
 	// 	Transport: &http.Transport{
 	// 		Proxy: func(_ *http.Request) (*url.URL, error) {
@@ -1095,7 +1095,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 	// 	},
 	// }
 
-	// Setzen Sie hier die notwendigen Header
+	// die notwendigen Header setzen
 	putReq.Header.Set("Content-Type", "application/octet-stream")
 	putReq.Header.Set("x-amz-acl", resultPresign.ACL)
 
