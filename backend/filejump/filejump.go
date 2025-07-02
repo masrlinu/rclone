@@ -68,9 +68,7 @@ func init() {
 			// Testing revealed names with leading spaces work fine.
 			// Also encode invalid UTF-8 bytes as json doesn't handle them properly.
 			Default: (encoder.Display |
-				encoder.EncodeBackSlash |
-				encoder.EncodeRightSpace |
-				encoder.EncodeInvalidUtf8),
+                encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
@@ -665,7 +663,7 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 	fs.Logf(nil, "FindLeaf: Suche nach Blatt '%s' in Verzeichnis mit ID '%s'", leaf, pathID)
 	// Find the leaf in pathID
 	found, err = f.listAll(ctx, pathID, true, false, true, func(item *api.Item) bool {
-		if strings.EqualFold(item.Name, leaf) {
+		if item.Name == leaf {
 			pathIDOut = item.GetID()
 			return true
 		}
@@ -1212,12 +1210,8 @@ func (o *Object) Storable() bool {
 // String returns a description of the Object
 func (o *Object) String() string {
 	fs.Logf(nil, "String: Erstelle String-Repräsentation für '%s'", o.remote)
-	if o.remote == "" {
-		return ""
-	}
-	err := o.readMetaData(context.Background())
-	if err != nil {
-		return err.Error()
+	if o == nil {
+		return "<nil>"
 	}
 	return o.remote
 }
@@ -1266,7 +1260,7 @@ func (o *Object) readMetaData(ctx context.Context) (err error) {
 	}
 	info, err := o.fs.readMetaDataForPath(ctx, o.remote)
 	if err != nil {
-		if err.Error() == "object not found" {
+		if errors.Is(err, fs.ErrorObjectNotFound) {
 			return fs.ErrorObjectNotFound
 		}
 		return err
