@@ -182,12 +182,12 @@ func CallJSON[T any, B any](f *Fs, ctx context.Context, method string, path stri
 		}
 
 		// Nur bei Erfolg und nicht-leerem Body loggen
-		if err == nil {
-			resultJSON, _ := json.Marshal(result)
-			if string(resultJSON) != "{}" && string(resultJSON) != "null" {
-				fs.Logf(nil, "CallJSON: Response Body: %s", string(resultJSON))
-			}
-		}
+		// if err == nil {
+		// 	resultJSON, _ := json.Marshal(result)
+		// 	if string(resultJSON) != "{}" && string(resultJSON) != "null" {
+		// 		fs.Logf(nil, "CallJSON: Response Body: %s", string(resultJSON))
+		// 	}
+		// }
 
 		return shouldRetry(ctx, resp, err)
 	})
@@ -645,7 +645,8 @@ func (f *Fs) String() string {
 
 // Precision of the ModTimes in this Fs
 func (f *Fs) Precision() time.Duration {
-	return time.Second
+	// filejump can have up to 3 seconds of difference of modtime
+	return 4 * time.Second
 }
 
 // Returns the supported hash types of the filesystem
