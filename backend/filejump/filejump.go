@@ -898,7 +898,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	size := src.Size()
 
 	if size < 0 {
-		return fs.ErrorNotSupported
+		return fs.ErrorNotImplemented
 	}
 
 	modTime := src.ModTime(ctx)
