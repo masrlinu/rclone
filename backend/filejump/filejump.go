@@ -1153,6 +1153,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 	if err != nil {
 		return fmt.Errorf("fehler beim Setzen der Metadaten: %w", err)
 	}
+	o.size = size
 
 	return nil
 }
