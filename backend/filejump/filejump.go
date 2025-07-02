@@ -889,46 +889,66 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 // The new object may have been created if an error is returned.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {
 	fs.Logf(nil, "Update wurde aufgerufen")
-	// if o.fs.tokenRenewer != nil {
-	// 	o.fs.tokenRenewer.Start()
-	// 	defer o.fs.tokenRenewer.Stop()
-	// }
-
-	// check if file exists
-	_, err = o.fs.NewObject(ctx, src.Remote())
-	if err != nil && err != fs.ErrorObjectNotFound {
-		fs.Logf(o, "Error checking for existing object: %v", err)
+	remote := o.Remote()
+	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, false)
+	if err != nil && err != fs.ErrorDirNotFound {
+		return fmt.Errorf("Update: failed to find path: %w", err)
 	}
 
-	if err == nil {
-		// object exists, remove it
-		err = o.Remove(ctx)
-		if err != nil {
-			return err
+	// If directory exists, check for and remove duplicates
+	if err != fs.ErrorDirNotFound {
+		var idsToDelete []int
+		_, listErr := o.fs.listAll(ctx, directoryID, false, true, true, func(item *api.Item) bool {
+			if item.Name == leaf {
+				id, convErr := strconv.Atoi(item.GetID())
+				if convErr == nil {
+					idsToDelete = append(idsToDelete, id)
+				} else {
+					fs.Logf(o, "Could not convert ID %q to int for deletion", item.GetID())
+				}
+			}
+			return false // find all duplicates
+		})
+		if listErr != nil {
+			return fmt.Errorf("Update: failed to list duplicates: %w", listErr)
+		}
+
+		if len(idsToDelete) > 0 {
+			fs.Logf(o, "Found %d duplicates for %q to delete", len(idsToDelete), remote)
+			type RequestDelete struct {
+				EntryIds      []int `json:"entryIds"`
+				DeleteForever bool  `json:"deleteForever"`
+			}
+			request := RequestDelete{
+				EntryIds:      idsToDelete,
+				DeleteForever: true,
+			}
+			type ResultDelete struct {
+				Status string `json:"status,omitempty"`
+			}
+			result, deleteErr := CallJSONPost[ResultDelete, RequestDelete](o.fs, ctx, "/file-entries/delete", &request)
+			if deleteErr != nil {
+				return fmt.Errorf("Update: failed to delete duplicates: %w", deleteErr)
+			}
+			if result.Status != "success" {
+				return fmt.Errorf("Update: deleting duplicates failed with status: %s", result.Status)
+			}
 		}
 	}
 
-	size := src.Size()
-
-	if size < 0 {
-		return fs.ErrorNotImplemented
-	}
-
-	modTime := src.ModTime(ctx)
-	remote := o.Remote()
-
-	// Create the directory for the object if it doesn't exist
-	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
+	// Now, proceed with creating the directory if it doesn't exist and uploading
+	leaf, directoryID, err = o.fs.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return err
 	}
 
-	// Upload with simple or multipart
-	// if size <= int64(o.fs.opt.UploadCutoff) {
+	size := src.Size()
+	if size < 0 {
+		return fs.ErrorNotImplemented
+	}
+	modTime := src.ModTime(ctx)
+
 	err = o.upload(ctx, in, leaf, directoryID, size, modTime, options...)
-	// } else {
-	// 	err = o.uploadMultipart(ctx, in, leaf, directoryID, size, modTime, options...)
-	// }
 	return err
 }
 
