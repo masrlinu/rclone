@@ -334,67 +334,62 @@ type listAllFn func(*api.Item) bool
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, activeOnly bool, fn listAllFn) (found bool, err error) {
-	fs.Logf(nil, "listAll: Aufruf für dirID '%s'", dirID)
+	fs.Logf(nil, "listAll wurde aufgerufen")
+	values := url.Values{}
+	values.Set("folderId", dirID)
+	// values.Set("parentIds", dirID)
+	values.Set("perPage", "1000")
+	// section=home
+	// folderId=0
+	// workspaceId=0
+	// orderBy=updated_at
+	// orderDir=desc
+	// page=1
 
-	type paginatedEntriesResponse struct {
-		Data        []api.Item `json:"data"`
-		CurrentPage int        `json:"current_page"`
-		LastPage    int        `json:"last_page"`
-	}
-
-	baseValues := url.Values{}
-	baseValues.Set("perPage", "1000")
-	baseValues.Set("section", "home")
-	baseValues.Set("orderBy", "updated_at")
-	baseValues.Set("orderDir", "desc")
-	if f.opt.WorkspaceID != "" {
-		baseValues.Set("workspaceId", f.opt.WorkspaceID)
-	}
-	// Only set folderId if we are not listing the root
-	if dirID != "" {
-		baseValues.Set("folderId", dirID)
-	}
-
-	for page := 1; ; page++ {
-		values := make(url.Values)
-		for k, v := range baseValues {
-			values[k] = v
+	var page *uint
+OUTER:
+	for {
+		if page != nil {
+			values.Set("page", strconv.FormatUint(uint64(*page), 10))
 		}
-		values.Set("page", strconv.Itoa(page))
 
-		result, err := CallJSON[paginatedEntriesResponse, struct{}](f, ctx, "GET", "/drive/file-entries", &values, nil)
+		result, err := CallJSONGet[api.FileEntries](f, ctx, "/drive/file-entries", &values)
 		if err != nil {
-			return found, fmt.Errorf("couldn't list files for dir '%s': %w", dirID, err)
+			return found, fmt.Errorf("couldn't list files: %w", err)
 		}
-
-		if len(result.Data) == 0 {
-			break
-		}
-
 		for i := range result.Data {
 			item := &result.Data[i]
 			if item.Type == api.ItemTypeFolder {
 				if filesOnly {
 					continue
 				}
-			} else { // Is a file
+			} else if item.Type != api.ItemTypeFolder {
 				if directoriesOnly {
 					continue
 				}
+			} else {
+				fs.Debugf(f, "Ignoring %q - unknown type %q", item.Name, item.Type)
+				continue
 			}
-
+			// At the moment, there is no trash at FileJump
+			// if activeOnly && item.ItemStatus != api.ItemStatusActive {
+			// 	continue
+			// }
+			// if f.opt.OwnedBy != "" && f.opt.OwnedBy != item.OwnedBy.Login {
+			// 	continue
+			// }
 			item.Name = f.opt.Enc.ToStandardName(item.Name)
 			if fn(item) {
 				found = true
-				return found, nil // Early exit
+				break OUTER
 			}
 		}
-
-		if result.CurrentPage >= result.LastPage {
+		page = result.NextPage
+		if page == nil {
 			break
 		}
 	}
-	return found, nil
+	return
 }
 
 // type Fs interface:
