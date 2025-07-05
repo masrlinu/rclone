@@ -42,15 +42,11 @@ func init() {
 			Name:     "access_token",
 			Help:     "You should create an API access token here: https://drive.filejump.com/account-settings",
 			Required: true,
-			// IsPassword: true,
-			// }, {
-			// 	Name:     config.ConfigEncoding,
-			// 	Help:     config.ConfigEncodingHelp,
-			// 	Advanced: true,
-			// 	Default: (encoder.Display |
-			// 		encoder.EncodeBackSlash |
-			// 		encoder.EncodeRightSpace |
-			// 		encoder.EncodeInvalidUtf8),
+		}, {
+			Name:     "workspace_id",
+			Help:     "The ID of the workspace to use. Defaults to personal workspace if not set or 0.",
+			Default:  "0",
+			Advanced: true,
 		}, {
 			Name:     "upload_cutoff",
 			Help:     "Cutoff for switching to multipart upload (>= 50 MiB).",
@@ -60,29 +56,18 @@ func init() {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
-			// From https://developer.box.com/docs/error-codes#section-400-bad-request :
-			// > Box only supports file or folder names that are 255 characters or less.
-			// > File names containing non-printable ascii, "/" or "\", names with leading
-			// > or trailing spaces, and the special names “.” and “..” are also unsupported.
-			//
-			// Testing revealed names with leading spaces work fine.
-			// Also encode invalid UTF-8 bytes as json doesn't handle them properly.
 			Default: (encoder.Display |
-                encoder.EncodeInvalidUtf8),
+				encoder.EncodeInvalidUtf8),
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	UploadCutoff fs.SizeSuffix `config:"upload_cutoff"`
-	// CommitRetries int                  `config:"commit_retries"`
-	Enc encoder.MultiEncoder `config:"encoding"`
-	// RootFolderID  string               `config:"root_folder_id"`
-	AccessToken string `config:"access_token"`
-	// ListChunk     int                  `config:"list_chunk"`
-	// OwnedBy       string               `config:"owned_by"`
-	// Impersonate   string               `config:"impersonate"`
+	UploadCutoff fs.SizeSuffix      `config:"upload_cutoff"`
+	Enc          encoder.MultiEncoder `config:"encoding"`
+	AccessToken  string               `config:"access_token"`
+	WorkspaceID  string               `config:"workspace_id"`
 }
 
 // Fs represents a remote filejump server
@@ -176,19 +161,17 @@ func CallJSON[T any, B any](f *Fs, ctx context.Context, method string, path stri
 	err := f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.CallJSON(ctx, &opts, body, &result)
 
+		if err != nil {
+			if resp != nil {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				fs.Logf(f, "API error response: status=%s, body=%s", resp.Status, string(bodyBytes))
+			}
+		}
+
 		// Nur Status loggen wenn nicht OK
 		if resp != nil && resp.StatusCode != http.StatusOK {
 			fs.Logf(nil, "CallJSON: Response Status: %s (%d)", resp.Status, resp.StatusCode)
 		}
-
-		// Nur bei Erfolg und nicht-leerem Body loggen
-		// if err == nil {
-		// 	resultJSON, _ := json.Marshal(result)
-		// 	if string(resultJSON) != "{}" && string(resultJSON) != "null" {
-		// 		fs.Logf(nil, "CallJSON: Response Body: %s", string(resultJSON))
-		// 	}
-		// }
-
 		return shouldRetry(ctx, resp, err)
 	})
 
@@ -275,38 +258,53 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 	f.srv.SetHeader("Authorization", "Bearer "+opt.AccessToken)
 
-	var rootID string
+	// Assume the root folder ID is always "0"
+	const rootID = "0"
 	f.dirCache = dircache.New(root, rootID, f)
 
-	// Find the current root
-	err = f.dirCache.FindRoot(ctx, false)
-	if err != nil {
-		// Assume it's a file
-		newRoot, remote := dircache.SplitPath(root)
-		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
-		tempF.root = newRoot
-		// Make new Fs which is the parent
-		err = tempF.dirCache.FindRoot(ctx, false)
+	// Check if the root directory is listable. This is a lightweight way to
+	// check the credentials and workspace_id are valid.
+	// We only need to do this once, when the Fs is created for the root.
+	if f.root == "" {
+		_, err = f.listAll(ctx, rootID, true, true, false, func(item *api.Item) bool {
+			return true // We don't need to process any items, just checking for an error is enough
+		})
 		if err != nil {
-			// No root so return old f
-			return f, nil
+			return nil, fmt.Errorf("failed to read root directory: %w. Please check your access_token and workspace_id", err)
 		}
-		_, err := tempF.newObjectWithInfo(ctx, remote, nil)
-		if err != nil {
-			if err == fs.ErrorObjectNotFound {
-				// File doesn't exist so return old f
-				return f, nil
-			}
-			return nil, err
-		}
-		// XXX: update the old f here instead of returning tempF, since
-		// `features` were already filled with functions having *f as a receiver.
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
-		return f, fs.ErrorIsFile
 	}
+
 	return f, nil
+}
+
+// listWorkspaces retrieves the list of workspaces for the current user and returns a formatted error
+func (f *Fs) listWorkspaces(ctx context.Context) error {
+	type Workspace struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}
+	type WorkspacesResponse struct {
+		Workspaces []Workspace `json:"workspaces"`
+	}
+
+	response, err := CallJSONGet[WorkspacesResponse](f, ctx, "/me/workspaces", nil)
+	if err != nil {
+		return fmt.Errorf("could not retrieve workspaces. Please check your access token. Original error: %w", err)
+	}
+
+	var workspaceInfo strings.Builder
+	workspaceInfo.WriteString("\nAvailable workspaces:\n")
+	workspaceInfo.WriteString("-------------------\n")
+	// Add personal workspace manually as it's not in the API response
+	workspaceInfo.WriteString(fmt.Sprintf("Personal Space | ID: 0\n"))
+
+	for _, ws := range response.Workspaces {
+		workspaceInfo.WriteString(fmt.Sprintf("%-14s | ID: %d\n", ws.Name, ws.ID))
+	}
+	workspaceInfo.WriteString("-------------------\n")
+	workspaceInfo.WriteString("Please add the correct 'workspace_id' to your rclone config.")
+
+	return errors.New(workspaceInfo.String())
 }
 
 // list the objects into the function supplied
@@ -321,62 +319,67 @@ type listAllFn func(*api.Item) bool
 //
 // If the user fn ever returns true then it early exits with found = true
 func (f *Fs) listAll(ctx context.Context, dirID string, directoriesOnly bool, filesOnly bool, activeOnly bool, fn listAllFn) (found bool, err error) {
-	fs.Logf(nil, "listAll wurde aufgerufen")
-	values := url.Values{}
-	values.Set("folderId", dirID)
-	// values.Set("parentIds", dirID)
-	values.Set("perPage", "1000")
-	// section=home
-	// folderId=0
-	// workspaceId=0
-	// orderBy=updated_at
-	// orderDir=desc
-	// page=1
+	fs.Logf(nil, "listAll: Aufruf für dirID '%s'", dirID)
 
-	var page *uint
-OUTER:
-	for {
-		if page != nil {
-			values.Set("page", strconv.FormatUint(uint64(*page), 10))
+	type paginatedEntriesResponse struct {
+		Data        []api.Item `json:"data"`
+		CurrentPage int        `json:"current_page"`
+		LastPage    int        `json:"last_page"`
+	}
+
+	baseValues := url.Values{}
+	baseValues.Set("perPage", "1000")
+	baseValues.Set("section", "home")
+	baseValues.Set("orderBy", "updated_at")
+	baseValues.Set("orderDir", "desc")
+	if f.opt.WorkspaceID != "" {
+		baseValues.Set("workspaceId", f.opt.WorkspaceID)
+	}
+	// Only set folderId if we are not listing the root
+	if dirID != "" {
+		baseValues.Set("folderId", dirID)
+	}
+
+	for page := 1; ; page++ {
+		values := make(url.Values)
+		for k, v := range baseValues {
+			values[k] = v
 		}
+		values.Set("page", strconv.Itoa(page))
 
-		result, err := CallJSONGet[api.FileEntries](f, ctx, "/drive/file-entries", &values)
+		result, err := CallJSON[paginatedEntriesResponse, struct{}](f, ctx, "GET", "/drive/file-entries", &values, nil)
 		if err != nil {
-			return found, fmt.Errorf("couldn't list files: %w", err)
+			return found, fmt.Errorf("couldn't list files for dir '%s': %w", dirID, err)
 		}
+
+		if len(result.Data) == 0 {
+			break
+		}
+
 		for i := range result.Data {
 			item := &result.Data[i]
 			if item.Type == api.ItemTypeFolder {
 				if filesOnly {
 					continue
 				}
-			} else if item.Type != api.ItemTypeFolder {
+			} else { // Is a file
 				if directoriesOnly {
 					continue
 				}
-			} else {
-				fs.Debugf(f, "Ignoring %q - unknown type %q", item.Name, item.Type)
-				continue
 			}
-			// At the moment, there is no trash at FileJump
-			// if activeOnly && item.ItemStatus != api.ItemStatusActive {
-			// 	continue
-			// }
-			// if f.opt.OwnedBy != "" && f.opt.OwnedBy != item.OwnedBy.Login {
-			// 	continue
-			// }
+
 			item.Name = f.opt.Enc.ToStandardName(item.Name)
 			if fn(item) {
 				found = true
-				break OUTER
+				return found, nil // Early exit
 			}
 		}
-		page = result.NextPage
-		if page == nil {
+
+		if result.CurrentPage >= result.LastPage {
 			break
 		}
 	}
-	return
+	return found, nil
 }
 
 // type Fs interface:
@@ -420,7 +423,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		// f.itemMetaCacheMu.Lock()
 		// cachedItemMeta, found := f.itemMetaCache[info.GetID()]
 		// if !found || cachedItemMeta.SequenceID < info.SequenceID {
-		// 	f.itemMetaCache[info.ID] = ItemMeta{SequenceID: info.SequenceID, ParentID: directoryID, Name: info.Name}
+		//     f.itemMetaCache[info.ID] = ItemMeta{SequenceID: info.SequenceID, ParentID: directoryID, Name: info.Name}
 		// }
 		// f.itemMetaCacheMu.Unlock()
 
@@ -676,19 +679,20 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 // CreateDir makes a directory with pathID as parent and name leaf
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	fs.Logf(nil, "CreateDir: Erstelle Verzeichnis '%s' in Parent-ID '%s'", leaf, pathID)
-	values := url.Values{}
-	values.Set("name", f.opt.Enc.FromStandardName(leaf))
-	values.Set("parentId", pathID)
 
 	type RequestCreateDir struct {
 		Name     string `json:"name"`
-		ParentID *int64 `json:"parentId"`
+		ParentID *int64 `json:"parentId,omitempty"` // Use omitempty to send null when nil
 	}
 
-	// Beim Erstellen des Requests:
-	iPathId, _ := strconv.ParseInt(pathID, 10, 64)
 	var parentID *int64
-	if pathID != "" {
+	// The API expects `null` for the root directory, not 0.
+	// dircache uses "0" as the ID for the root.
+	if pathID != "" && pathID != "0" {
+		iPathId, err := strconv.ParseInt(pathID, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("invalid parent ID %q: %w", pathID, err)
+		}
 		parentID = &iPathId
 	}
 
@@ -696,18 +700,10 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 		Name:     f.opt.Enc.FromStandardName(leaf),
 		ParentID: parentID,
 	}
+
 	type ResultCreateDir struct {
 		Folder struct {
-			// Type        string    `json:"type,omitempty"`
-			// Name        string    `json:"name,omitempty"`
-			// FileName    string    `json:"file_name,omitempty"`
-			// ParentID    int       `json:"parent_id,omitempty"`
-			// OwnerID     int       `json:"owner_id,omitempty"`
-			// WorkspaceID int       `json:"workspace_id,omitempty"`
-			// UpdatedAt   time.Time `json:"updated_at,omitempty"`
-			// CreatedAt   time.Time `json:"created_at,omitempty"`
-			ID   int    `json:"id,omitempty"`
-			Path string `json:"path,omitempty"`
+			ID int `json:"id,omitempty"`
 		} `json:"folder,omitempty"`
 		Status string `json:"status,omitempty"`
 	}
@@ -715,10 +711,12 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	result, err := CallJSONPost[ResultCreateDir, RequestCreateDir](f, ctx, "/folders", &requestCreateDir)
 
 	if err != nil {
-		// fmt.Printf("...Error %v\n", err)
 		return "", err
 	}
-	// fmt.Printf("...Id %q\n", *info.Id)
+	if result.Status != "success" {
+		return "", fmt.Errorf("failed to create directory, status: %s", result.Status)
+	}
+
 	return strconv.Itoa(result.Folder.ID), nil
 }
 
@@ -1056,6 +1054,11 @@ func getExtensionAndMime(filename string) (extension, mimeType string) {
 
 func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID string, size int64, modTime time.Time, options ...fs.OpenOption) (err error) {
 	directoryIDInt, _ := strconv.Atoi(directoryID)
+	workspaceIDInt, err := strconv.Atoi(o.fs.opt.WorkspaceID)
+	if err != nil {
+		fs.Debugf(o, "Could not parse workspace_id %q, defaulting to 0: %v", o.fs.opt.WorkspaceID, err)
+		workspaceIDInt = 0
+	}
 
 	// Anfordern der vorzeichneten URL
 	type ResultPresign struct {
@@ -1084,7 +1087,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		Disk:         "uploads",
 		Size:         size,
 		Extension:    ext,
-		WorkspaceID:  0,
+		WorkspaceID:  workspaceIDInt,
 		ParentID:     directoryIDInt,
 		RelativePath: "",
 	}
@@ -1099,41 +1102,16 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		return fmt.Errorf("fehler beim Anfordern der vorzeichneten URL: Status ist nicht 'success'")
 	}
 
-	// // OPTIONS-Request
-	// optionsReq, err := http.NewRequestWithContext(ctx, "OPTIONS", resultPresign.URL, nil)
-	// if err != nil {
-	// 	return fmt.Errorf("fehler beim Erstellen des OPTIONS-Requests: %w", err)
-	// }
-
-	// optionsResp, err := http.DefaultClient.Do(optionsReq)
-	// if err != nil {
-	// 	return fmt.Errorf("fehler beim Ausführen des OPTIONS-Requests: %w", err)
-	// }
-	// optionsResp.Body.Close()
-
 	// PUT-Request
 	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, resultPresign.URL, in)
 	if err != nil {
 		return fmt.Errorf("fehler beim Erstellen des PUT-Requests: %w", err)
 	}
 
-	// // Einen einmaligen Client nur für diesen Request erstellen
-	// client := &http.Client{
-	// 	Transport: &http.Transport{
-	// 		Proxy: func(_ *http.Request) (*url.URL, error) {
-	// 			return url.Parse("http://localhost:8888")
-	// 		},
-	// 		TLSClientConfig: &tls.Config{
-	// 			InsecureSkipVerify: true,
-	// 		},
-	// 	},
-	// }
-
 	// die notwendigen Header setzen
 	putReq.Header.Set("Content-Type", "application/octet-stream")
 	putReq.Header.Set("x-amz-acl", resultPresign.ACL)
 
-	// putResp, err := client.Do(putReq)
 	putResp, err := http.DefaultClient.Do(putReq)
 	if err != nil {
 		return fmt.Errorf("fehler beim Hochladen der Datei: %w", err)
@@ -1143,9 +1121,6 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 	if putResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(putResp.Body)
 		return fmt.Errorf("fehler beim Hochladen der Datei: HTTP %d: %s", putResp.StatusCode, string(body))
-		// } else {
-		// 	body, _ := io.ReadAll(putResp.Body)
-		// 	fs.Log(nil, fmt.Sprintf("Datei hochgeladen: HTTP %v: %s", putResp.StatusCode, string(body)))
 	}
 
 	type RequestEntries struct {
@@ -1160,7 +1135,7 @@ func (o *Object) upload(ctx context.Context, in io.Reader, leaf, directoryID str
 		ClientExtension string      `json:"clientExtension"`
 	}
 	requestEntries := RequestEntries{
-		WorkspaceID: 0,
+		WorkspaceID: workspaceIDInt,
 		ParentID: func() interface{} {
 			if directoryIDInt == 0 {
 				return ""
