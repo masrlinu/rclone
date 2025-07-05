@@ -258,20 +258,42 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}).Fill(ctx, f)
 	f.srv.SetHeader("Authorization", "Bearer "+opt.AccessToken)
 
-	// Assume the root folder ID is always "0"
-	const rootID = "0"
-	f.dirCache = dircache.New(root, rootID, f)
+	// Find the ID of the root directory
+	rootID := "0" // Start at the real root of the remote
+	if f.root != "" {
+		// Walk the path to find the ID of the root
+		parts := strings.Split(f.root, "/")
+		for _, part := range parts {
+			if part == "" {
+				continue
+			}
+			nextID, found, findErr := f.FindLeaf(ctx, rootID, part)
+			if findErr != nil {
+				return nil, fmt.Errorf("failed to find path component %q of root %q: %w", part, f.root, findErr)
+			}
+			if !found {
+				// If the root path doesn't exist, we should create it.
+				fs.Debugf(f, "Root path component %q not found, creating it in parent %q", part, rootID)
+				var createErr error
+				nextID, createErr = f.CreateDir(ctx, rootID, part)
+				if createErr != nil {
+					return nil, fmt.Errorf("failed to create path component %q of root %q: %w", part, f.root, createErr)
+				}
+			}
+			rootID = nextID
+		}
+	}
+
+	// Now we have the correct rootID, so we can create the dircache
+	f.dirCache = dircache.New(f.root, rootID, f)
 
 	// Check if the root directory is listable. This is a lightweight way to
 	// check the credentials and workspace_id are valid.
-	// We only need to do this once, when the Fs is created for the root.
-	if f.root == "" {
-		_, err = f.listAll(ctx, rootID, true, true, false, func(item *api.Item) bool {
-			return true // We don't need to process any items, just checking for an error is enough
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to read root directory: %w. Please check your access_token and workspace_id", err)
-		}
+	_, err = f.listAll(ctx, rootID, true, true, false, func(item *api.Item) bool {
+		return true // We don't need to process any items, just checking for an error is enough
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read root directory: %w. Please check your access_token and workspace_id", err)
 	}
 
 	return f, nil
@@ -401,14 +423,17 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 	var iErr error
 	_, err = f.listAll(ctx, directoryID, false, false, true, func(info *api.Item) bool {
-		remote := path.Join(dir, info.Name)
+		remote, err := fs.CleanRemotePath(path.Join(dir, info.Name))
+		if err != nil {
+			iErr = fmt.Errorf("failed to clean remote path: %w", err)
+			return true
+		}
 		if info.Type == api.ItemTypeFolder {
 			// cache the directory ID for later lookups
 			f.dirCache.Put(remote, info.GetID())
 			d := fs.NewDir(remote, info.ModTime()).SetID(info.GetID())
-			// FIXME more info from dir?
 			entries = append(entries, d)
-		} else if info.Type != api.ItemTypeFolder {
+		} else {
 			o, err := f.newObjectWithInfo(ctx, remote, info)
 			if err != nil {
 				iErr = err
